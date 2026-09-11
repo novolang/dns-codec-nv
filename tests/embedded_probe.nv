@@ -1,0 +1,117 @@
+// tests/embedded_probe.nv — the package's device claim, as a program
+// that either builds for a Cortex-M or does not.
+//
+// The shard audit's `core-embedded` row copies this and the modules its
+// `use` lines reach into a package of their own and runs
+//
+//   novo build --target=nrf52-qemu src/probe.nv
+//
+// which produces a real Cortex-M4 ELF or fails.  For a DNS codec the
+// claim is what decided the shape of `DnsName`: a device doing service
+// discovery on a local link parses the same messages a resolver does,
+// and a name held as text would have put the whole package out of its
+// reach.
+//
+// It BUILDS; it does not run.  Every function it calls is a `todo()`
+// today, so a device that executed this would panic on the first line
+// of `main`.  What is being checked is the TIER: `--target=nrf52-qemu`
+// stamps `@tier(embedded)` on every function it compiles, so the
+// checker walks the module and refuses a `Str` concatenation, a `Bytes`
+// call or an unbounded `while` wherever the implementation later puts
+// one.
+//
+// WHAT IS NOT HERE, AND WHY.  `name_from_text` and `name_text`, the two
+// functions that cross to presentation form.  They take or return a
+// `Str`, and the embedded runtime defines no `novo_str_byte_at`, so a
+// device build cannot have them — which is exactly why a name is its
+// wire bytes everywhere else in this package.  On a device a name
+// arrives in a packet, is compared to another name in a packet, and
+// goes back out in a packet; it is never typed in.
+//
+// WHERE THE BYTES COME FROM.  At `@tier(embedded)` a list literal is an
+// implicit heap allocation and a boxed struct literal is a heap cell,
+// so a probe cannot write a message down.  `received` stands where the
+// socket is; its body is `todo()` like everything else here.
+
+use dns_codec
+
+// The datagram, or the framed chunk, that arrived.
+fn received() -> [u8]
+    todo("probe.received")
+
+fn main() [hw, time]
+    // The header, which is what a responder reads first and what
+    // decides whether the rest is worth parsing.
+    match dns_codec.decode_header(received())
+        Err(_)  => hal.uart.write("dns-codec: bad header\n")
+        Ok(hdr) =>
+            if hdr.flags.response
+                hal.uart.write("dns-codec: a response\n")
+            if hdr.flags.truncated
+                hal.uart.write("dns-codec: ask again over tcp\n")
+            match hdr.flags.rcode
+                DnsNoError       => hal.uart.write("dns-codec: ok\n")
+                DnsNameError     => hal.uart.write("dns-codec: nxdomain\n")
+                DnsRcodeOther(_) => hal.uart.write("dns-codec: some other rcode\n")
+                _                => hal.uart.write("dns-codec: refused or failed\n")
+
+    // The name walk, which is the part with the pointers in it and the
+    // part a hostile message attacks.
+    match dns_codec.decode_name(received(), dns_codec.HEADER_LEN)
+        Err(_)  => hal.uart.write("dns-codec: bad name\n")
+        Ok(got) =>
+            if dns_codec.name_label_count(got.name) > 0
+                hal.uart.write("dns-codec: named\n")
+            if dns_codec.name_eq(got.name, dns_codec.root_name())
+                hal.uart.write("dns-codec: the root\n")
+
+    // A question and a record, so the two `Result`-returning readers
+    // are compiled for the device rather than only the total functions.
+    match dns_codec.decode_question(received(), dns_codec.HEADER_LEN)
+        Err(_)  => hal.uart.write("dns-codec: bad question\n")
+        Ok(got) =>
+            match got.question.question_type
+                DnsTypeA    => hal.uart.write("dns-codec: A\n")
+                DnsTypeAaaa => hal.uart.write("dns-codec: AAAA\n")
+                DnsTypeSrv  => hal.uart.write("dns-codec: SRV\n")
+                DnsTypePtr  => hal.uart.write("dns-codec: PTR\n")
+                _           => hal.uart.write("dns-codec: some other type\n")
+
+    match dns_codec.decode_record(received(), dns_codec.HEADER_LEN)
+        Err(_)  => hal.uart.write("dns-codec: bad record\n")
+        Ok(got) =>
+            match got.record.data
+                RdataA(_)          => hal.uart.write("dns-codec: an address\n")
+                RdataSrv(_)        => hal.uart.write("dns-codec: a service\n")
+                RdataTxt(_)        => hal.uart.write("dns-codec: some text\n")
+                RdataUnknown(_, _) => hal.uart.write("dns-codec: forwarded\n")
+                _                  => hal.uart.write("dns-codec: something else\n")
+
+    // The whole message, which a device parsing a service-discovery
+    // response reads in one go.
+    let message: Result<DnsMessage, DnsCodecError> = dns_codec.decode_message(received())
+    match message
+        Err(_)  => hal.uart.write("dns-codec: bad message\n")
+        Ok(msg) =>
+            if list.len(msg.answers) > 0
+                hal.uart.write("dns-codec: answered\n")
+            match dns_codec.find_opt(msg)
+                Err(_)    => hal.uart.write("dns-codec: bad opt\n")
+                Ok(found) =>
+                    match found
+                        None    => hal.uart.write("dns-codec: no edns0\n")
+                        Some(_) => hal.uart.write("dns-codec: edns0\n")
+
+    // And the TCP framing, which is a device's other transport.
+    match dns_codec.scan_tcp(received())
+        DnsTcpPartial  => hal.uart.write("dns-codec: partial\n")
+        DnsTcpWhole(_) => hal.uart.write("dns-codec: whole\n")
+    let step: DnsTcpStep = dns_codec.feed_tcp(dns_codec.tcp_reader(), received())
+    match step.message
+        None    => hal.uart.write(".")
+        Some(_) => hal.uart.write("!")
+    if dns_codec.tcp_pending_len(step.reader) > dns_codec.UDP_MESSAGE_MAX
+        hal.uart.write("dns-codec: over budget\n")
+
+    loop
+        core.rt.sleep_ms(1000)

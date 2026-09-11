@@ -1,0 +1,33 @@
+[package]
+name        = "dns-codec-nv"
+version     = "0.0.1"
+description = "RFC 1035 wire format as a codec with no socket: header, question, the resource records a resolver meets, name compression both directions, EDNS0, and a feed-and-drain reader for TCP's length-prefixed framing.  Interface only — every body is a todo()."
+license     = "Apache-2.0"
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `core`: a message in, a message out.  The socket, the retry policy and
+# the cache are the resolver's, and none of them is here — which is what
+# lets the same codec serve a resolver, an authoritative server, a
+# capture tool and a device doing service discovery on a local link.
+layer       = "core"
+
+category    = "networking"
+
+tags        = ["dns", "rfc1035", "edns0", "codec", "sans-io", "resolver", "name-compression", "embedded"]
+repository  = "https://github.com/novolang/dns-codec-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.8.9"
+
+[docs.pages]
+"README.md" = "DNS messages, without a socket"
+
+[dependencies]
+# None.  A wire codec over `[u8]` needs the language and nothing else,
+# which is the property that lets it sit under a host resolver and
+# inside a device doing service discovery on the same local link.
