@@ -4,6 +4,10 @@ Every published version, newest first. This file is on the publish
 allow-list, so it travels with the package: it is the only thing a
 consumer deciding whether to upgrade can read.
 
+## 0.0.2 — 2026-09-15
+
+README rewritten to the package README style guide (docs/writing-a-readme.md); no change to the interface.
+
 ## 0.0.1 — 2026-09-11
 
 The **interface**, before anyone implements it. Every signature, every
@@ -40,3 +44,20 @@ around: a `@value` struct may not be the payload of a `Result`, an
 optional, an enum or a boxed struct, so a wire codec whose decode can
 fail has no fixed-width spelling available. The README says what that
 costs.
+
+### Design notes
+
+The interface is a port of the resolver that lived in the novo-lang
+repository, and five things changed in the port. A name stopped being a
+`Str`: the reference joined labels with dots, which loses a label that
+contains one and puts the codec out of reach of a device. The three
+ad-hoc result enums the reference carried, one per parse, became the one
+`Result`. Resource records arrived: the reference parsed no RDATA at
+all, so A, AAAA, CNAME, MX, TXT, SRV, NS, SOA and PTR are all new.
+Compression gained its encoding half, because the reference followed
+pointers and never wrote one. EDNS(0) arrived, which is what lifts the
+reference's 512-byte cap and its frequent fallback to TCP.
+
+The error type is spelled `DnsCodecError` and not `DnsError`, because
+the resolver already declares a `DnsError` and a type's identity is its
+name across the whole assembly. The two can be in one program today.
