@@ -4,6 +4,14 @@ Every published version, newest first. This file is on the publish
 allow-list, so it travels with the package: it is the only thing a
 consumer deciding whether to upgrade can read.
 
+## 0.0.3 — 2026-09-25
+
+One test changed so that it builds with novo 0.10.0.  In that release
+`list.append` writes into the list it is given.  The test that feeds two
+framed messages at once now builds them with `list.concat`, which answers
+a new list and leaves the framed message as it was.  No change to the
+interface.
+
 ## 0.0.2 — 2026-09-15
 
 README rewritten to the package README style guide (docs/writing-a-readme.md); no change to the interface.

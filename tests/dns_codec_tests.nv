@@ -732,7 +732,7 @@ fn test_a_reader_starts_empty_and_gives_back_what_it_is_fed()
 @test
 fn test_a_second_message_stays_in_until_it_is_taken()
     let one = dns_codec.frame_tcp(zeros(12))
-    let two = list.append(one, one)
+    let two = list.concat(one, one)
     let first = dns_codec.feed_tcp(dns_codec.tcp_reader(), two)
     match first.message
         None    => test.fail("the first message is whole")

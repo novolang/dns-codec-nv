@@ -1,6 +1,6 @@
 [package]
 name        = "dns-codec-nv"
-version     = "0.0.2"
+version     = "0.0.3"
 description = "RFC 1035 wire format as a codec with no socket: header, question, the resource records a resolver meets, name compression both directions, EDNS0, and a feed-and-drain reader for TCP's length-prefixed framing.  Interface only — every body is a todo()."
 license     = "Apache-2.0"
 
