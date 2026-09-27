@@ -4,6 +4,42 @@ Every published version, newest first. This file is on the publish
 allow-list, so it travels with the package: it is the only thing a
 consumer deciding whether to upgrade can read.
 
+## 0.1.0 — 2026-09-27
+
+First implementation of the interface published as 0.0.1.
+
+- Every function has a body: names and their presentation form, the
+  header and its flags, questions and the ten modelled record types,
+  compression in both directions, whole messages with and without a
+  size limit, the EDNS(0) OPT record, and TCP framing.
+- `DnsCodecError` gains `DnsEmptyLabel(index)`. `name_of_labels`
+  refuses an empty label with it, because an empty label in the middle
+  of a name is a terminator and would end the name early. A `match`
+  over the error type needs the new arm. This is the one breaking
+  change.
+- `DnsPointerLoop` now means a pointer that lands inside the labels the
+  same walk has already read, or a walk longer than 255 steps.
+  `DnsForwardPointer` still refuses a pointer that goes forwards or at
+  itself.
+- `encode_message_limited` keeps records in wire order, answers then
+  authority then additional, and drops the first record that does not
+  fit and every record after it.
+- `encode_record` writes a TXT string longer than 255 bytes as
+  consecutive strings of at most 255.
+- `name_text` escapes each of `"().;\@$` with a backslash and every
+  byte outside printable ASCII as `\DDD`, so its answer always reads
+  back through `name_from_text`.
+- Every function is `@tier(rt)`, and the whole module, the two text
+  functions included, builds for `--target=nrf52-qemu`.
+- Three of the published API tests asserted wrong numbers and are
+  corrected: the expanded length of `FOO.F.ISI.ARPA` is 16 bytes, not
+  18, and the A and SRV record tests read their fields one byte late.
+- Two new suites: `tests/wire_tests.nv`, whole messages in hex checked
+  by hand against the RFCs, and `tests/roundtrip_tests.nv`, properties
+  over generated messages. `tests/coverage.sh` measures line coverage
+  over `src/`.
+- The toolchain floor is 0.13.0.
+
 ## 0.0.3 — 2026-09-25
 
 One test changed so that it builds with novo 0.10.0.  In that release

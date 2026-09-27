@@ -11,12 +11,6 @@ package is multicast DNS and service discovery on the local link, and
 it uses these messages on a different port under different rules. This
 package depends on nothing.
 
-**Status: NOT IMPLEMENTED — interface only.** Every function is declared
-with its full signature, but every body is a `todo()` that panics when
-called. The package is published so its design can be reviewed and
-depended on before it is implemented. Version 0.1.0 will be the first
-working release.
-
 ## What a DNS message is
 
 A message is a twelve-byte **header** followed by four sections: the
@@ -85,10 +79,20 @@ novo pkg add dns-codec-nv
 use dns_codec
 
 fn main() [io]
-    // One response datagram, as it came off the socket.
+    // One response datagram, as it came off the socket: the answer to
+    // an A query for example.com.
     let datagram: [u8] = [0x12 as u8, 0x34 as u8, 0x81 as u8, 0x80 as u8,
                           0x00 as u8, 0x01 as u8, 0x00 as u8, 0x01 as u8,
-                          0x00 as u8, 0x00 as u8, 0x00 as u8, 0x01 as u8]
+                          0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+                          0x07 as u8, 0x65 as u8, 0x78 as u8, 0x61 as u8,
+                          0x6D as u8, 0x70 as u8, 0x6C as u8, 0x65 as u8,
+                          0x03 as u8, 0x63 as u8, 0x6F as u8, 0x6D as u8,
+                          0x00 as u8, 0x00 as u8, 0x01 as u8, 0x00 as u8,
+                          0x01 as u8,
+                          0xC0 as u8, 0x0C as u8, 0x00 as u8, 0x01 as u8,
+                          0x00 as u8, 0x01 as u8, 0x00 as u8, 0x00 as u8,
+                          0x0E as u8, 0x10 as u8, 0x00 as u8, 0x04 as u8,
+                          0x5D as u8, 0xB8 as u8, 0xD8 as u8, 0x22 as u8]
 
     // The header is the first twelve bytes, and it says whether the
     // rest of the answer arrived.
@@ -103,10 +107,11 @@ fn main() [io]
         Err(e)  => println("the message is wrong: ${e.message()}")
         Ok(msg) =>
             for record in msg.answers
+                let owner = dns_codec.name_text(record.name)
                 match record.data
-                    RdataA(octets)        => println("${list.len(octets)} bytes of address")
-                    RdataCname(target)    => println("an alias of ${dns_codec.name_label_count(target)} labels")
-                    RdataTxt(strings)     => println("${list.len(strings)} text strings")
+                    RdataA(octets)        => println("${owner} has address ${octets[0]}.${octets[1]}.${octets[2]}.${octets[3]}")
+                    RdataCname(target)    => println("${owner} is an alias of ${dns_codec.name_text(target)}")
+                    RdataTxt(strings)     => println("${owner} has ${list.len(strings)} text strings")
                     RdataUnknown(code, _) => println("type ${code}, kept as its bytes")
                     _                     => println("some other record")
 
@@ -120,10 +125,8 @@ fn main() [io]
                         Some(opt) => println("EDNS0: up to ${opt.payload_size} bytes")
 ```
 
-Build and test with `novo pkg build` and `novo test`. Today `novo test`
-fails on purpose: every test reaches a `not implemented: dns_codec.<fn>`
-panic. The tests are the specification the implementation will have to
-satisfy.
+The program prints `example.com. has address 93.184.216.34` and `no
+EDNS0: 512 bytes is the limit`.
 
 ## What the package contains
 
@@ -166,10 +169,13 @@ producing messages. Keep one reader per connection.
    contain a dot, so a dotted string is lossy, and section 5.1's
    presentation form escapes a dot inside a label as `\.` and any byte
    as `\DDD`. `name_from_text` and `name_text` are the only two
-   functions that cross to text.
+   functions that cross to text. `name_text` writes every byte outside
+   printable ASCII as `\DDD` and puts a backslash before each of
+   `"().;\@$`, so its answer always reads back to the same bytes.
 2. **A label may not exceed 63 bytes and a name's wire form may not
-   exceed 255** (section 2.3.4). `name_of_labels` refuses both, which is
-   where a caller building a name out of user input is stopped.
+   exceed 255** (section 2.3.4). `name_of_labels` refuses both, and an
+   empty label, which is where a caller building a name out of user
+   input is stopped.
 3. **Names compare without regard to ASCII case** (section 2.3.3).
    `EXAMPLE.COM` and `example.com` are the same name. Use `name_eq`
    rather than comparing the wire bytes.
@@ -180,10 +186,13 @@ producing messages. Keep one reader per connection.
    name ends in a pointer, the record's own next field begins two bytes
    after the pointer started, not where the expanded name ended.
    Confusing the two is the classic section 4.1.4 error.
-6. **A pointer only ever points backwards.** Section 4.1.4 writes a
-   pointer to an earlier name, so `decode_name` refuses a forward or
-   self-referential pointer with `DnsForwardPointer`. `DnsPointerLoop`
-   is the hop-count backstop behind that rule.
+6. **A pointer only ever points backwards, and never into the name
+   being read.** Section 4.1.4 writes a pointer to an earlier name, so
+   `decode_name` refuses a forward or self-referential pointer with
+   `DnsForwardPointer`. A pointer that goes back into the labels the
+   same walk has already read would read them again for ever, and is
+   `DnsPointerLoop`. A walk also stops after 255 steps, the most a name
+   of 127 labels and their pointers can need.
 7. **A pointer reaches only the first 16,383 bytes of a message.** The
    offset is fourteen bits. `encode_name` writes a name past that in
    full and does not remember it.
@@ -205,7 +214,9 @@ producing messages. Keep one reader per connection.
     said BADVERS, and retries forever.
 12. **A TXT record is a list of byte strings, not one string**
     (section 3.3.14). `RdataTxt` holds the list, and joining them
-    changes what the record says.
+    changes what the record says. A string longer than 255 bytes does
+    not fit its length byte, and `encode_record` writes it as
+    consecutive strings of at most 255.
 13. **Names inside RDATA are compressed only for the record types
     RFC 1035 itself defines.** Every type specified later, SRV among
     them, writes its names in full. `encode_name_uncompressed` is that
@@ -215,32 +226,38 @@ producing messages. Keep one reader per connection.
     anywhere, including between the two bytes of that prefix.
     `feed_tcp` hands back one message per call, so a read that completed
     two leaves the second inside and `take_tcp` is what gets it.
-15. **An unknown opcode, response code, type or class keeps its
+15. **A limited encode keeps records in wire order.** When the
+    message does not fit, `encode_message_limited` keeps answers, then
+    authority records, then additional records, for as long as each
+    fits. It drops the first record that does not and every record
+    after it, writes the counts of what it kept, and sets the TC bit.
+16. **An unknown opcode, response code, type or class keeps its
     number.** `DnsTypeOther`, `DnsRcodeOther` and `RdataUnknown` hold
     what arrived, so a message a resolver forwards comes out the way it
     went in.
 
 ## Running on a microcontroller
 
-novo-lang lets a package state which of its modules can run on a device
-with no heap allocator, and the compiler checks that claim on every
-build. Here the claim covers the whole package. Every function is
-arithmetic over bytes the caller supplies, and the package has no
-dependencies.
+novo-lang lets a package state which of its modules can run on a
+microcontroller, and the compiler checks that claim on every build.
+Here the claim covers the whole package, the two text functions
+included. Every function is arithmetic over bytes the caller supplies,
+and the package has no dependencies.
+
+A message is made of lists and records, so the codec needs the heap the
+device runtime provides. Every function is marked `@tier(rt)`, the tier
+that allows bounded allocation and refuses input, output and unbounded
+loops. A firmware function that calls the codec is `@tier(rt)` too.
 
 ```bash
 novo build --target=nrf52-qemu src/main.nv
 ```
 
-`tests/embedded_probe.nv` is that claim as a program that either builds
-or does not. It builds, producing a Cortex-M4 executable.
-
-Two functions are outside the claim. `name_from_text` and `name_text`
-take or return a `Str`, and the device runtime has no string support, so
-a device build does without them. This is why a name is its wire bytes
-everywhere else here: on a device a name arrives in a packet, is
-compared with another name from a packet, and goes back out in a packet,
-and it is never typed in.
+`tests/embedded_probe.nv` is that claim as a program. It builds a
+Cortex-M4 executable that decodes a response, compares and prints its
+names, writes a query and reassembles a TCP stream split inside its
+length prefix, and prints `PASS: dns-codec-embedded` when every answer
+holds.
 
 ## What is not included
 
@@ -255,11 +272,9 @@ and it is never typed in.
   package above this one.
 - **Zone files.** A zone file is presentation-format text, and the
   functions that read one belong beside the server that loads it.
-- **A decode that allocates nothing.** Every decoded value here is a
-  boxed struct or an enum with a payload. A fixed-width value struct may
-  not be the payload of a `Result`, an optional or an enum on this
-  toolchain, and every decode in a wire codec can fail. The encode path
-  and the constants are unaffected.
+- **A codec that allocates nothing.** Every message, name and record
+  here is a list or a boxed struct, so encoding and decoding both use
+  the heap. A device with no heap at all cannot use this package.
 
 ## Related packages
 
@@ -285,43 +300,35 @@ and it is never typed in.
 
 ```bash
 novo test tests/dns_codec_tests.nv       # 48 tests against the signatures
+novo test tests/wire_tests.nv            # 36 tests over whole messages
+novo test tests/roundtrip_tests.nv       # 4 properties over generated messages
+bash tests/coverage.sh                   # line coverage over src/
 ```
 
-The byte strings the suite asserts against are the specifications' own.
-RFC 1035 section 4.1.4's compression example is laid out at the offsets
-the RFC itself uses, so the three compressed forms it shows are read
-back from the bytes it prints: a name that ends in a pointer, a pointer
-into the middle of an earlier name, and the root. RFC 2782 supplies the
-SRV record, RFC 3596 the AAAA record and RFC 6891 section 6.1.2 the OPT
-record.
+The byte strings the suites assert against are the specifications'
+own. RFC 1035 section 4.1.4's compression example is laid out at the
+offsets the RFC itself uses, so the three compressed forms it shows are
+read back from the bytes it prints: a name that ends in a pointer, a
+pointer into the middle of an earlier name, and the root. RFC 2782
+supplies the SRV record, RFC 3596 the AAAA record and RFC 6891
+section 6.1.2 the OPT record.
 
-The suite checks that a name survives the crossing to text and back,
-that a header round trips, that a forward pointer and a self-pointer are
-refused, that an encoder reuses a pointer for a repeated name, that a
-record whose RDLENGTH disagrees with its contents is refused, that a
-limited encode truncates and says so, that the response code is read as
-twelve bits, and that a message split between the two bytes of a TCP
-length prefix is reassembled.
+`tests/wire_tests.nv` holds whole messages written out in hex and
+checked by hand against those sections: the query `dig` sends, with its
+OPT record and cookie option, and a response whose owner names and
+CNAME target are all pointers. Each is decoded field by field and then
+re-encoded, and the re-encoding has to be the same bytes, which checks
+that the encoder compresses the way a real responder does. The suite
+also holds a record of every modelled type, every refusal with the
+value it carries, and each error message word for word.
 
-The tests compile today and fail at run, each on the `not implemented:
-dns_codec.<fn>` panic that is its body. That is the expected state of an
-interface release. They turn green one at a time as bodies land.
-
-## Implementation status
-
-| Item | Implemented |
-| --- | --- |
-| The `HEADER_LEN`, `LABEL_MAX`, `NAME_MAX`, `UDP_MESSAGE_MAX`, `EDNS_PAYLOAD_DEFAULT`, `POINTER_TAG` and `EDNS_VERSION` constants | yes (they are constants) |
-| `dns_codec.root_name`, `.name_of_labels`, `.name_labels`, `.name_label_count`, `.name_eq` | no |
-| `dns_codec.name_from_text`, `.name_text` | no |
-| `dns_codec.encode_header`, `.decode_header`, `.encode_flags`, `.decode_flags` | no |
-| `dns_codec.type_code`, `.type_of_code`, `.class_code`, `.class_of_code` | no |
-| `dns_codec.compressor`, `.encode_name`, `.encode_name_uncompressed`, `.decode_name` | no |
-| `dns_codec.encode_question`, `.decode_question`, `.encode_record`, `.decode_record` | no |
-| `dns_codec.encode_message`, `.encode_message_limited`, `.decode_message` | no |
-| `dns_codec.opt_record`, `.read_opt`, `.find_opt`, `.extended_rcode` | no |
-| `dns_codec.frame_tcp`, `.scan_tcp`, `.tcp_reader`, `.feed_tcp`, `.take_tcp`, `.tcp_pending_len` | no |
-| `dns_codec.DnsCodecError.message` | no |
+`tests/roundtrip_tests.nv` generates messages from a fixed seed, with
+names that share suffixes and labels that hold dots, spaces,
+backslashes and bytes above ASCII. It checks that every decoded message
+re-encodes to the same bytes, that every name survives its
+presentation form, that a framed stream split at any byte gives back
+the same messages, and that a limited encode always produces a message
+that decodes.
 
 ## Licence
 
