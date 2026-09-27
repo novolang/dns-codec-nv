@@ -1,11 +1,4 @@
-// tests/dns_codec_tests.nv — the API tests, written against the
-// signatures.
-//
-// They COMPILE today and they FAIL at run, with `not implemented:
-// dns_codec.<fn>` from the `todo()` that is each body.  That is the
-// expected state of an interface release: the compiler has checked
-// every signature, every type and every effect row, and nothing else
-// has been checked because there is nothing else yet.
+// tests/dns_codec_tests.nv — the API tests, one or more per function.
 //
 // The vectors are the specifications' own: RFC 1035 § 4.1.4's
 // compression example laid out at the offsets it uses, RFC 2782's SRV
@@ -75,8 +68,6 @@ fn query_flags() -> DnsFlags
 
 @test
 fn test_the_sizes_the_format_fixes()
-    // Real today: the constants are the one part of an interface that
-    // needs no body.
     test.assert_eq(dns_codec.HEADER_LEN, 12)
     test.assert_eq(dns_codec.LABEL_MAX, 63)
     test.assert_eq(dns_codec.NAME_MAX, 255)
@@ -263,7 +254,7 @@ fn test_the_rfc1035_compression_example_reads_back()
 @test
 fn test_a_name_that_ends_in_a_pointer_resumes_past_the_pointer()
     // 0x40 is FOO followed by a pointer to 0x20.  The NAME is
-    // FOO.F.ISI.ARPA — eighteen wire bytes once expanded — and the
+    // FOO.F.ISI.ARPA, sixteen wire bytes once expanded, and the
     // reader carries on at 0x46, just past the two pointer bytes, NOT
     // at 0x2C where the pointed-at name ended.  Confusing those two is
     // the § 4.1.4 bug every implementation writes once.
@@ -271,7 +262,7 @@ fn test_a_name_that_ends_in_a_pointer_resumes_past_the_pointer()
     match dns_codec.decode_name(message, 0x40)
         Err(_)  => test.fail("0x40 is FOO.F.ISI.ARPA")
         Ok(got) =>
-            test.assert_eq(list.len(got.name.wire), 18)
+            test.assert_eq(list.len(got.name.wire), 16)
             test.assert_eq(got.name.wire[0] as Int, 3)
             test.assert_eq(got.next, 0x46)
 
@@ -389,7 +380,7 @@ fn test_an_a_record_is_four_octets_in_the_order_they_are_written()
     let written = dns_codec.encode_record(dns_codec.compressor(), record, 12)
     // 17 name + 2 type + 2 class + 4 ttl + 2 rdlength + 4 rdata.
     test.assert_eq(list.len(written.bytes), 31)
-    test.assert_eq(written.bytes[28] as Int, 93)
+    test.assert_eq(written.bytes[27] as Int, 93)
     test.assert_eq(written.bytes[31 - 1] as Int, 34)
 
 @test
@@ -444,9 +435,9 @@ fn test_an_srv_record_is_rfc_2782_s_four_fields()
     // 27 fixed + 6 of numbers + the target, which RFC 2782 forbids
     // compressing, so all 17 bytes of it.
     test.assert_eq(list.len(written.bytes), 50)
-    test.assert_eq(written.bytes[29] as Int, 5)   // weight, big-endian low byte
-    test.assert_eq(written.bytes[30] as Int, 0x13)   // port 5060 = 0x13C4
-    test.assert_eq(written.bytes[31] as Int, 0xC4)
+    test.assert_eq(written.bytes[30] as Int, 5)   // weight, big-endian low byte
+    test.assert_eq(written.bytes[31] as Int, 0x13)   // port 5060 = 0x13C4
+    test.assert_eq(written.bytes[32] as Int, 0xC4)
 
 @test
 fn test_a_soa_record_is_two_names_and_five_numbers()
@@ -532,11 +523,18 @@ fn test_a_count_the_bytes_cannot_satisfy_is_refused()
     // ANCOUNT 1 with nothing after the question: a malformed message
     // read as a short one is how a resolver caches an empty answer.
     var message = zeros(12)
+    message[5] = 0x01 as u8   // QDCOUNT 1
+    message[7] = 0x01 as u8   // ANCOUNT 1
     message = list.append(message, www_example_com())
     message = list.append(message, [0x00 as u8, 0x01 as u8, 0x00 as u8, 0x01 as u8])
     match dns_codec.decode_message(message)
-        Ok(_)  => test.assert(true)
-        Err(_) => test.assert(true)
+        Ok(_)  => test.fail("the header promised an answer")
+        Err(e) =>
+            match e
+                DnsCountMismatch(declared, found) =>
+                    test.assert_eq(declared, 1)
+                    test.assert_eq(found, 0)
+                _                                 => test.fail("the refusal is DnsCountMismatch")
 
 @test
 fn test_a_limited_encode_truncates_and_says_so()

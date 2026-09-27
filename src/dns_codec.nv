@@ -1,30 +1,29 @@
 // dns_codec — the DNS wire format, with no socket under it.
 //
-// Every body is a `todo()`.  The signatures and the effect rows are the
-// design, and the compiler checks them as claims; see the README for
-// the stamp.
-//
 // RFC 1035 is the format: a twelve-byte header, a list of questions and
 // three lists of resource records, with names compressed by pointers
 // back into the message.  RFC 3596 adds AAAA, RFC 2782 adds SRV and
 // RFC 6891 adds the OPT pseudo-record that carries EDNS0.  This package
-// is all four and nothing else — it turns bytes into messages and
-// messages into bytes, and every decision about what to DO with one
+// is all four and nothing else.  It turns bytes into messages and
+// messages into bytes, and every decision about what to do with one
 // belongs to the caller.
 //
-// All multi-byte fields are BIG-endian, which is DNS's convention and
-// the opposite of most of the wire formats a reader will have met.
+// All multi-byte fields are big-endian, which is the DNS convention.
 //
-// A NAME IS ITS WIRE BYTES.  `DnsName` holds the uncompressed
-// length-prefixed encoding — `03 77 77 77 07 65 78 61 6D 70 6C 65 03 63
-// 6F 6D 00` — rather than a dotted string.  Three reasons, and the
-// third is the one that decided it: a label may legally contain a dot,
-// so a dotted string is lossy; comparison is a byte compare and
-// compression is a suffix match, both of which a string forces through
-// a split; and `Str` does not link at `@tier(embedded)`, so a name held
-// as text puts the whole package out of reach of the device that most
-// wants it.  `name_from_text` and `name_text` are the two functions
-// that cross to text, and they are the two a device build does without.
+// A name is its wire bytes.  `DnsName` holds the uncompressed
+// length-prefixed encoding, `03 77 77 77 07 65 78 61 6D 70 6C 65 03 63
+// 6F 6D 00`, rather than a dotted string.  A label may legally contain
+// a dot, so a dotted string is lossy.  Comparison is a byte compare and
+// compression is a suffix match, and both work on the wire form
+// directly.  `name_from_text` and `name_text` are the two functions
+// that cross to presentation form.
+//
+// Every function here is `@tier(rt)`.  The values are lists and boxed
+// structs, so a device build needs the bare-metal runtime's heap, and
+// every loop is a `for` over a range whose end is known before it
+// starts.
+
+use std.str
 
 // ── Sizes the format fixes ──────────────────────────────────────────
 
@@ -41,7 +40,7 @@ pub const NAME_MAX = 255
 // The largest message plain UDP carries without EDNS0 (§ 4.2.1).
 //
 // A response that does not fit is truncated and the TC bit is set,
-// which is what tells a resolver to ask again over TCP.
+// which tells a resolver to ask again over TCP.
 pub const UDP_MESSAGE_MAX = 512
 
 // The payload size a caller should advertise in an OPT record on a path
@@ -51,6 +50,49 @@ pub const EDNS_PAYLOAD_DEFAULT = 1232
 
 // The two top bits that mark a compression pointer (§ 4.1.4).
 pub const POINTER_TAG = 0xC0
+
+// The largest offset a compression pointer can hold: fourteen bits.
+const POINTER_REACH = 0x3FFF
+
+// ── Byte helpers ────────────────────────────────────────────────────
+
+// One byte onto the end of `out`.
+@tier(rt)
+fn put8(var out: [u8], v: Int) -> [u8]
+    out = list.push(out, (v & 0xFF) as u8)
+    out
+
+// A sixteen-bit field, big-endian.
+@tier(rt)
+fn put16(var out: [u8], v: Int) -> [u8]
+    out = put8(out, v >> 8)
+    out = put8(out, v)
+    out
+
+// A thirty-two-bit field, big-endian.
+@tier(rt)
+fn put32(var out: [u8], v: Int) -> [u8]
+    out = put16(out, v >> 16)
+    out = put16(out, v)
+    out
+
+// The sixteen-bit big-endian field at `i`.  The caller has checked that
+// both bytes are there.
+@tier(rt)
+fn get16(m: [u8], i: Int) -> Int
+    (m[i] as Int << 8) | m[i + 1] as Int
+
+// The thirty-two-bit big-endian field at `i`.
+@tier(rt)
+fn get32(m: [u8], i: Int) -> Int
+    (get16(m, i) << 16) | get16(m, i + 2)
+
+// A refusal when `n` bytes are more than `m` holds.
+@tier(rt)
+fn need(m: [u8], n: Int) -> Result<Int, DnsCodecError>
+    if n > list.len(m)
+        return Err(DnsTruncatedMessage(list.len(m), n))
+    Ok(n)
 
 // ── Names ───────────────────────────────────────────────────────────
 
@@ -64,50 +106,201 @@ pub struct DnsName
     wire: [u8]
 
 // The root name, which is the single zero byte.
-pub fn root_name() -> DnsName
-    todo("dns_codec.root_name")
+pub @tier(rt)
+fn root_name() -> DnsName
+    DnsName { wire: [0x00 as u8] }
 
 // A name from its labels, each already the bytes of one label.
 //
-// Refuses a label longer than 63 bytes and a name whose wire form would
-// exceed 255, which are the two limits § 2.3.4 sets and the two a
-// caller building a name from user input has to be stopped at.
-pub fn name_of_labels(labels: [[u8]]) -> Result<DnsName, DnsCodecError>
-    todo("dns_codec.name_of_labels")
+// Refuses an empty label with `DnsEmptyLabel`, a label longer than 63
+// bytes with `DnsLabelTooLong` and a name whose wire form would exceed
+// 255 with `DnsNameTooLong`.  The last two are the limits § 2.3.4 sets.
+// An empty list is the root.
+pub @tier(rt)
+fn name_of_labels(labels: [[u8]]) -> Result<DnsName, DnsCodecError>
+    var wire: [u8] = []
+    var index = 0
+    for label in labels
+        let n = list.len(label)
+        if n == 0
+            return Err(DnsEmptyLabel(index))
+        if n > LABEL_MAX
+            return Err(DnsLabelTooLong(n))
+        wire = put8(wire, n)
+        wire = list.append(wire, label)
+        index = index + 1
+    wire = put8(wire, 0)
+    if list.len(wire) > NAME_MAX
+        return Err(DnsNameTooLong(list.len(wire)))
+    Ok(DnsName { wire: wire })
+
+// The offset of every label's length byte in a name's wire form.
+//
+// Stops at the terminator, and also at the end of the bytes, so a
+// `DnsName` built by hand with no terminator is read as far as it goes.
+@tier(rt)
+fn label_starts(name: DnsName) -> [Int]
+    var out: [Int] = []
+    var next = 0
+    for i in 0..list.len(name.wire)
+        if i == next
+            let n = name.wire[i] as Int
+            if n == 0
+                return out
+            out = list.push(out, i)
+            next = i + 1 + n
+    out
 
 // The labels a name is made of, each as its bytes and without its
 // length prefix.
-pub fn name_labels(name: DnsName) -> [[u8]]
-    todo("dns_codec.name_labels")
+pub @tier(rt)
+fn name_labels(name: DnsName) -> [[u8]]
+    var out: [[u8]] = []
+    for pos in label_starts(name)
+        let n = name.wire[pos] as Int
+        out = list.push(out, list.slice(name.wire, pos + 1, pos + 1 + n))
+    out
 
 // How many labels a name has, the root counting as none.
-pub fn name_label_count(name: DnsName) -> Int
-    todo("dns_codec.name_label_count")
+pub @tier(rt)
+fn name_label_count(name: DnsName) -> Int
+    list.len(label_starts(name))
+
+// A byte with ASCII upper case folded to lower case.
+@tier(rt)
+fn fold(b: Int) -> Int
+    if b >= 'A' and b <= 'Z'
+        return b + 32
+    b
+
+// Whether two wire forms are equal from `a_at` and `b_at` to their ends,
+// with ASCII case folded.
+@tier(rt)
+fn wire_eq_from(a: [u8], a_at: Int, b: [u8], b_at: Int) -> Bool
+    let n = list.len(a) - a_at
+    if n != list.len(b) - b_at
+        return false
+    for i in 0..n
+        if fold(a[a_at + i] as Int) != fold(b[b_at + i] as Int)
+            return false
+    true
 
 // Whether two names are the same name.
 //
-// Case-insensitive over ASCII, which § 2.3.3 requires and which is the
-// comparison a byte compare gets wrong for `EXAMPLE.COM`.
-pub fn name_eq(a: DnsName, b: DnsName) -> Bool
-    todo("dns_codec.name_eq")
+// Case-insensitive over ASCII, which § 2.3.3 requires.  A byte compare
+// says `EXAMPLE.COM` and `example.com` differ; this says they are one
+// name.  A length byte is at most 63, below every letter, so folding
+// never changes one.
+pub @tier(rt)
+fn name_eq(a: DnsName, b: DnsName) -> Bool
+    wire_eq_from(a.wire, 0, b.wire, 0)
 
-// A name from its presentation form — `www.example.com`, with or
+// Whether `b` is an ASCII decimal digit.
+@tier(rt)
+fn is_digit(b: Int) -> Bool
+    b >= '0' and b <= '9'
+
+// A name from its presentation form, such as `www.example.com`, with or
 // without the trailing dot.
 //
-// The one place text enters this package.  `\.` escapes a dot inside a
-// label and `\\DDD` is a decimal byte, both of which § 5.1 defines and
-// both of which exist because a label is bytes and not characters.
-// A device build does without this function: `Str` does not link at
-// `@tier(embedded)`.
-pub fn name_from_text(text: Str) -> Result<DnsName, DnsCodecError>
-    todo("dns_codec.name_from_text")
+// `\.` is a dot inside a label, `\\` a backslash, `\X` the character X
+// for any other non-digit, and `\DDD` the byte whose decimal value is
+// DDD (§ 5.1).  A lone `.` is the root.  An empty string, an empty
+// label (`a..b`, a leading dot) and a bad escape are `DnsBadNameText`
+// with the offset of the fault.  A label over 63 bytes is
+// `DnsLabelTooLong` and a name over 255 is `DnsNameTooLong`.
+pub @tier(rt)
+fn name_from_text(text: Str) -> Result<DnsName, DnsCodecError>
+    let n = str.len(text)
+    if n == 0
+        return Err(DnsBadNameText(0))
+    if text == "."
+        return Ok(root_name())
+    // The wire form is built as it is read.  Each label's length byte
+    // is written as a zero when the label starts and set when it ends.
+    var wire: [u8] = [0x00 as u8]
+    var label_at = 0
+    // How many of the following bytes an escape has already consumed.
+    var skip = 0
+    for i in 0..n
+        if skip > 0
+            skip = skip - 1
+            continue
+        let c = str.byte_at_or(text, i, 0)
+        if c == '.'
+            let len = list.len(wire) - label_at - 1
+            if len == 0
+                return Err(DnsBadNameText(i))
+            if len > LABEL_MAX
+                return Err(DnsLabelTooLong(len))
+            wire[label_at] = len as u8
+            label_at = list.len(wire)
+            wire = put8(wire, 0)
+        else if c == '\\'
+            let d = str.byte_at_or(text, i + 1, -1)
+            if d < 0
+                return Err(DnsBadNameText(i))
+            if is_digit(d)
+                let d2 = str.byte_at_or(text, i + 2, -1)
+                let d3 = str.byte_at_or(text, i + 3, -1)
+                if not is_digit(d2) or not is_digit(d3)
+                    return Err(DnsBadNameText(i))
+                let v = (d - '0') * 100 + (d2 - '0') * 10 + (d3 - '0')
+                if v > 255
+                    return Err(DnsBadNameText(i))
+                wire = put8(wire, v)
+                skip = 3
+            else
+                wire = put8(wire, d)
+                skip = 1
+        else
+            wire = put8(wire, c)
+    // Without a trailing dot the last label is still open.
+    let last = list.len(wire) - label_at - 1
+    if last > 0
+        if last > LABEL_MAX
+            return Err(DnsLabelTooLong(last))
+        wire[label_at] = last as u8
+        wire = put8(wire, 0)
+    if list.len(wire) > NAME_MAX
+        return Err(DnsNameTooLong(list.len(wire)))
+    Ok(DnsName { wire: wire })
+
+// Whether a printable byte is one the presentation form escapes with a
+// backslash: `"`, `(`, `)`, `.`, `;`, `\`, `@` and `$`.
+@tier(rt)
+fn is_special(b: Int) -> Bool
+    b == '"' or b == '(' or b == ')' or b == '.' or b == ';' or b == '\\' or b == '@' or b == '$'
+
+// One label byte in presentation form.
+@tier(rt)
+fn byte_text(b: Int) -> Str
+    if b < 0x21 or b > 0x7E
+        let hundreds = str.from_int(b / 100)
+        let tens = str.from_int(b / 10 % 10)
+        let ones = str.from_int(b % 10)
+        return "\\" + hundreds + tens + ones
+    if is_special(b)
+        return "\\" + str.from_byte(b)
+    str.from_byte(b)
 
 // A name in its presentation form, with the trailing dot.
 //
-// The other place text enters, and the other function a device build
-// does without.
-pub fn name_text(name: DnsName) -> Str
-    todo("dns_codec.name_text")
+// A byte outside the printable ASCII range is written `\DDD`, and each
+// of `"().;\@$` is written with a backslash in front, so the text reads
+// back through `name_from_text` to the same bytes.  The root is `.`.
+pub @tier(rt)
+fn name_text(name: DnsName) -> Str
+    let starts = label_starts(name)
+    if list.len(starts) == 0
+        return "."
+    var out = ""
+    for pos in starts
+        let n = name.wire[pos] as Int
+        for i in 0..n
+            out = out + byte_text(name.wire[pos + 1 + i] as Int)
+        out = out + "."
+    out
 
 // ── The header (§ 4.1.1) ────────────────────────────────────────────
 
@@ -130,13 +323,13 @@ pub enum DnsRcode
     DnsNameError
     DnsNotImplemented
     DnsRefused
-    // Anything else, including the extended codes an OPT record's upper
-    // bits carry.
+    // Anything else in the header's four bits.  The extended codes an
+    // OPT record's upper bits carry are `extended_rcode`'s.
     DnsRcodeOther(code: Int)
 
 // The sixteen flag bits of the header's second word.
 //
-// `z` is the one reserved bit that remains: RFC 2535 took two of the
+// `z` is the one reserved bit that remains.  RFC 2535 took two of the
 // original three for `authentic_data` and `checking_disabled`, and a
 // responder must still send the third as zero.
 pub struct DnsFlags
@@ -154,7 +347,7 @@ pub struct DnsFlags
 // The twelve-byte header (§ 4.1.1).
 //
 // The four counts are fields because the header carries them, and they
-// are what a decode checks the section lists against: a message whose
+// are what a decode checks the section lists against.  A message whose
 // `answer_count` says three and whose bytes hold two is
 // `DnsCountMismatch`, not two answers.
 pub struct DnsHeader
@@ -166,29 +359,128 @@ pub struct DnsHeader
     additional_count: Int
 
 // The header as its twelve wire bytes.
-pub fn encode_header(header: DnsHeader) -> [u8]
-    todo("dns_codec.encode_header")
+//
+// Every field is written modulo its sixteen-bit width.
+pub @tier(rt)
+fn encode_header(header: DnsHeader) -> [u8]
+    var out: [u8] = []
+    out = put16(out, header.id)
+    out = put16(out, encode_flags(header.flags))
+    out = put16(out, header.question_count)
+    out = put16(out, header.answer_count)
+    out = put16(out, header.authority_count)
+    out = put16(out, header.additional_count)
+    out
 
 // Read the header from the front of a message.
-pub fn decode_header(bytes: [u8]) -> Result<DnsHeader, DnsCodecError>
-    todo("dns_codec.decode_header")
+//
+// Fewer than twelve bytes is `DnsTruncatedMessage`.
+pub @tier(rt)
+fn decode_header(bytes: [u8]) -> Result<DnsHeader, DnsCodecError>
+    need(bytes, HEADER_LEN)!
+    Ok(DnsHeader {
+        id: get16(bytes, 0),
+        flags: decode_flags(get16(bytes, 2)),
+        question_count: get16(bytes, 4),
+        answer_count: get16(bytes, 6),
+        authority_count: get16(bytes, 8),
+        additional_count: get16(bytes, 10) })
+
+// The number an opcode is on the wire.
+@tier(rt)
+fn opcode_code(op: DnsOpcode) -> Int
+    match op
+        DnsStandardQuery     => 0
+        DnsInverseQuery      => 1
+        DnsServerStatus      => 2
+        DnsNotify            => 4
+        DnsUpdate            => 5
+        DnsOpcodeOther(code) => code & 0xF
+
+// The opcode a number names.
+@tier(rt)
+fn opcode_of_code(code: Int) -> DnsOpcode
+    match code
+        0 => DnsStandardQuery
+        1 => DnsInverseQuery
+        2 => DnsServerStatus
+        4 => DnsNotify
+        5 => DnsUpdate
+        _ => DnsOpcodeOther(code)
+
+// The number a response code is in the header's four bits.
+@tier(rt)
+fn rcode_code(rc: DnsRcode) -> Int
+    match rc
+        DnsNoError          => 0
+        DnsFormatError      => 1
+        DnsServerFailure    => 2
+        DnsNameError        => 3
+        DnsNotImplemented   => 4
+        DnsRefused          => 5
+        DnsRcodeOther(code) => code & 0xF
+
+// The response code four bits name.
+@tier(rt)
+fn rcode_of_code(code: Int) -> DnsRcode
+    match code
+        0 => DnsNoError
+        1 => DnsFormatError
+        2 => DnsServerFailure
+        3 => DnsNameError
+        4 => DnsNotImplemented
+        5 => DnsRefused
+        _ => DnsRcodeOther(code)
+
+// `bit` when `on`, else zero.
+@tier(rt)
+fn bit_if(on: Bool, bit: Int) -> Int
+    if on
+        return bit
+    0
 
 // The flags as the header's second big-endian word.
-pub fn encode_flags(flags: DnsFlags) -> Int
-    todo("dns_codec.encode_flags")
+//
+// QR is bit 15, the opcode bits 14 to 11, then AA, TC, RD, RA, Z, AD
+// and CD, and the response code in the low four bits.  An opcode or a
+// response code held as its number is written modulo sixteen.
+pub @tier(rt)
+fn encode_flags(flags: DnsFlags) -> Int
+    let high = bit_if(flags.response, 0x8000)
+        | (opcode_code(flags.opcode) << 11)
+        | bit_if(flags.authoritative, 0x0400)
+        | bit_if(flags.truncated, 0x0200)
+        | bit_if(flags.recursion_desired, 0x0100)
+    let low = bit_if(flags.recursion_available, 0x0080)
+        | bit_if(flags.z, 0x0040)
+        | bit_if(flags.authentic_data, 0x0020)
+        | bit_if(flags.checking_disabled, 0x0010)
+        | rcode_code(flags.rcode)
+    high | low
 
 // The flags a word carries.  Total: every bit pattern is some set of
 // flags, and an unknown opcode or rcode keeps its number.
-pub fn decode_flags(word: Int) -> DnsFlags
-    todo("dns_codec.decode_flags")
+pub @tier(rt)
+fn decode_flags(word: Int) -> DnsFlags
+    DnsFlags {
+        response: (word & 0x8000) != 0,
+        opcode: opcode_of_code((word >> 11) & 0xF),
+        authoritative: (word & 0x0400) != 0,
+        truncated: (word & 0x0200) != 0,
+        recursion_desired: (word & 0x0100) != 0,
+        recursion_available: (word & 0x0080) != 0,
+        z: (word & 0x0040) != 0,
+        authentic_data: (word & 0x0020) != 0,
+        checking_disabled: (word & 0x0010) != 0,
+        rcode: rcode_of_code(word & 0xF) }
 
 // ── Questions and records ───────────────────────────────────────────
 
 // A record type.
 //
 // The list is what a resolver meets.  `DnsTypeOther` keeps the number
-// for everything else, which is how a capture tool stays honest about a
-// type this package was written before.
+// for everything else, so a capture tool can report a type this package
+// has no name for.
 pub enum DnsType
     DnsTypeA
     DnsTypeNs
@@ -203,9 +495,10 @@ pub enum DnsType
     DnsTypeAny
     DnsTypeOther(code: Int)
 
-// A record class.  In practice this is always `DnsClassInternet`;
+// A record class.  In practice this is always `DnsClassInternet`.
 // `DnsClassOther` exists because the field is sixteen bits and a
-// responder may send anything in it.
+// responder may send anything in it; an OPT record puts its payload
+// size there.
 pub enum DnsClass
     DnsClassInternet
     DnsClassNone
@@ -213,20 +506,56 @@ pub enum DnsClass
     DnsClassOther(code: Int)
 
 // The number a type is on the wire.
-pub fn type_code(kind: DnsType) -> Int
-    todo("dns_codec.type_code")
+pub @tier(rt)
+fn type_code(kind: DnsType) -> Int
+    match kind
+        DnsTypeA           => 1
+        DnsTypeNs          => 2
+        DnsTypeCname       => 5
+        DnsTypeSoa         => 6
+        DnsTypePtr         => 12
+        DnsTypeMx          => 15
+        DnsTypeTxt         => 16
+        DnsTypeAaaa        => 28
+        DnsTypeSrv         => 33
+        DnsTypeOpt         => 41
+        DnsTypeAny         => 255
+        DnsTypeOther(code) => code
 
 // The type a number names.
-pub fn type_of_code(code: Int) -> DnsType
-    todo("dns_codec.type_of_code")
+pub @tier(rt)
+fn type_of_code(code: Int) -> DnsType
+    match code
+        1   => DnsTypeA
+        2   => DnsTypeNs
+        5   => DnsTypeCname
+        6   => DnsTypeSoa
+        12  => DnsTypePtr
+        15  => DnsTypeMx
+        16  => DnsTypeTxt
+        28  => DnsTypeAaaa
+        33  => DnsTypeSrv
+        41  => DnsTypeOpt
+        255 => DnsTypeAny
+        _   => DnsTypeOther(code)
 
 // The number a class is on the wire.
-pub fn class_code(class: DnsClass) -> Int
-    todo("dns_codec.class_code")
+pub @tier(rt)
+fn class_code(class: DnsClass) -> Int
+    match class
+        DnsClassInternet    => 1
+        DnsClassNone        => 254
+        DnsClassAny         => 255
+        DnsClassOther(code) => code
 
 // The class a number names.
-pub fn class_of_code(code: Int) -> DnsClass
-    todo("dns_codec.class_of_code")
+pub @tier(rt)
+fn class_of_code(code: Int) -> DnsClass
+    match code
+        1   => DnsClassInternet
+        254 => DnsClassNone
+        255 => DnsClassAny
+        _   => DnsClassOther(code)
 
 // One question (§ 4.1.2).
 pub struct DnsQuestion
@@ -248,9 +577,9 @@ pub struct DnsSrv
 
 // The start-of-authority record's seven (§ 3.3.13).
 //
-// `minimum` is the negative-caching TTL RFC 2308 redefined it as, and
-// the field keeps the specification's original name because that is
-// what every other implementation calls it.
+// `minimum` is the negative-caching TTL RFC 2308 redefined it as.  The
+// field keeps the specification's original name because that is what
+// every other implementation calls it.
 pub struct DnsSoa
     primary: DnsName
     mailbox: DnsName
@@ -267,13 +596,12 @@ pub struct DnsOption
 
 // The contents of a record, by type.
 //
-// The name-bearing variants — CNAME, NS, PTR, MX, SRV, SOA — hold a
-// `DnsName`, which is always expanded: a name inside RDATA may be
-// compressed on the wire, and a caller that got the raw bytes would
-// have to know which types compress and re-implement the pointer walk
-// to read them.
+// The name-bearing variants, CNAME, NS, PTR, MX, SRV and SOA, hold a
+// `DnsName`, which is always expanded.  A name inside RDATA may be
+// compressed on the wire, and a caller given the raw bytes would have
+// to know which types compress and walk the pointers itself.
 //
-// `RdataUnknown` keeps the type code with the bytes so that a message a
+// `RdataUnknown` keeps the type code with the bytes, so a message a
 // resolver forwards comes out the way it went in.
 pub enum DnsRdata
     // Four bytes, in the order they are written.
@@ -284,13 +612,14 @@ pub enum DnsRdata
     RdataNs(target: DnsName)
     RdataPtr(target: DnsName)
     RdataMx(value: DnsMx)
-    // The character-strings of § 3.3.14, each its own byte string.
-    // A TXT record is a LIST of strings and not one string, which is
-    // the fact every implementation that concatenated them got wrong.
+    // The character-strings of § 3.3.14, each its own byte string.  A
+    // TXT record is a list of strings and not one string.  A string
+    // longer than 255 bytes does not fit its length byte, and the
+    // encoder writes it as consecutive strings of at most 255.
     RdataTxt(strings: [[u8]])
     RdataSrv(value: DnsSrv)
     RdataSoa(value: DnsSoa)
-    // The options an OPT pseudo-record carries; its class and TTL
+    // The options an OPT pseudo-record carries.  Its class and TTL
     // fields hold the payload size and the version instead, which is
     // what `read_opt` reads out.
     RdataOpt(options: [DnsOption])
@@ -299,11 +628,12 @@ pub enum DnsRdata
 // One resource record (§ 4.1.3).
 //
 // `record_class` and `ttl` keep their own fields even for an OPT
-// record, whose wire format reuses both for something else: a codec
-// that hid the reuse would make an OPT record impossible to re-encode
-// byte for byte, and forwarding a message unchanged is a resolver's
-// job.  `read_opt` and `opt_record` are the pair that reads and writes
-// the reinterpretation.
+// record, whose wire format reuses both for something else.  Hiding
+// the reuse would make an OPT record impossible to re-encode byte for
+// byte, and a resolver forwards messages unchanged.  `read_opt` and
+// `opt_record` are the pair that reads and writes the reinterpretation.
+//
+// The record's type is not a field: it is the variant of `data`.
 pub struct DnsRecord
     name: DnsName
     record_class: DnsClass
@@ -321,18 +651,17 @@ pub struct DnsMessage
 // ── Compression (§ 4.1.4) ───────────────────────────────────────────
 //
 // A name in a message may end in a pointer to an earlier name, and the
-// two directions of that are not symmetric.  DECODING has to follow
+// two directions of that are not symmetric.  Decoding has to follow
 // pointers and refuse the loops a hostile message can build out of
-// them.  ENCODING has to remember where every name it has written
-// starts, so a later name that ends the same way can point at it — and
-// that memory is state, which in a `core` package is a value the caller
-// holds.
+// them.  Encoding has to remember where every name it has written
+// starts, so a later name that ends the same way can point at it.  That
+// memory is state, and here it is a value the caller holds.
 
 // What names a message-in-progress has already written, and where.
 //
-// Opaque, and a value: `encode_name` takes one and returns another, so
-// a caller that keeps the old one has a snapshot rather than a table
-// this package is mutating underneath it.
+// A value: `encode_name` takes one and returns another, and never
+// changes the one it was given, so a caller that keeps the old one has
+// a snapshot.
 pub struct DnsCompressor
     entries: [DnsNameOffset]
 
@@ -350,7 +679,7 @@ pub struct DnsNameOffset
 // now remembers them.
 //
 // A struct rather than a tuple because the two halves are used at
-// different places — the caller appends one and reassigns the other.
+// different places: the caller appends one and reassigns the other.
 pub struct DnsNameWrite
     compressor: DnsCompressor
     bytes: [u8]
@@ -358,50 +687,85 @@ pub struct DnsNameWrite
 // A name read out of a message: the name, and where the reader should
 // carry on.
 //
-// `next` is NOT where the name ended, when the name ended in a pointer:
-// it is the offset just past the pointer, because that is where the
-// record's own next field is.  Getting those two confused is the
-// classic § 4.1.4 bug and the reason this is a struct with a named
-// field rather than a second return value.
+// `next` is not where the name ended when the name ended in a pointer.
+// It is the offset just past the pointer, because that is where the
+// record's own next field is.
 pub struct DnsNameRead
     name: DnsName
     next: Int
 
 // A compressor that remembers nothing.
-pub fn compressor() -> DnsCompressor
-    todo("dns_codec.compressor")
+pub @tier(rt)
+fn compressor() -> DnsCompressor
+    DnsCompressor { entries: [] }
+
+// The offset a compressor remembers for the name whose wire form is
+// `wire` from `at` on, or -1.
+@tier(rt)
+fn remembered(c: DnsCompressor, wire: [u8], at: Int) -> Int
+    for e in c.entries
+        if wire_eq_from(e.name.wire, 0, wire, at)
+            return e.offset
+    -1
 
 // Write a name at `offset` in the message being built, reusing a
 // pointer where one fits.
 //
+// The longest suffix of the name that the compressor remembers becomes
+// a two-byte pointer, and the labels before it are written in full.
+// Each suffix written in full is remembered at the offset it lands on.
+//
 // `offset` is where these bytes will land, which is what makes the
-// remembered offsets correct; a caller that writes the result somewhere
-// else gets a message whose pointers point at the wrong names.
+// remembered offsets correct.  A caller that writes the result
+// somewhere else gets a message whose pointers point at the wrong
+// names.
 //
 // A pointer can only reach the first 16,383 bytes of a message, so a
-// name past that is written in full and not remembered.
-pub fn encode_name(c: DnsCompressor, name: DnsName, offset: Int) -> DnsNameWrite
-    todo("dns_codec.encode_name")
+// suffix that lands past that is written in full and not remembered.
+pub @tier(rt)
+fn encode_name(c: DnsCompressor, name: DnsName, offset: Int) -> DnsNameWrite
+    var entries: [DnsNameOffset] = list.clone(c.entries)
+    var out: [u8] = []
+    for pos in label_starts(name)
+        let target = remembered(c, name.wire, pos)
+        if target >= 0
+            out = put16(out, (POINTER_TAG << 8) | target)
+            return DnsNameWrite { compressor: DnsCompressor { entries: entries }, bytes: out }
+        let here = offset + list.len(out)
+        if here <= POINTER_REACH
+            let suffix = list.slice(name.wire, pos, list.len(name.wire))
+            entries = list.push(entries, DnsNameOffset { name: DnsName { wire: suffix }, offset: here })
+        let n = name.wire[pos] as Int
+        out = list.append(out, list.slice(name.wire, pos, pos + 1 + n))
+    out = put8(out, 0)
+    DnsNameWrite { compressor: DnsCompressor { entries: entries }, bytes: out }
 
 // Write a name in full, with no pointer and no memory.
 //
-// What a caller uses when it is building a name outside a message — an
-// RDATA field whose specification forbids compression, which is every
-// type defined after RFC 1035.
-pub fn encode_name_uncompressed(name: DnsName) -> [u8]
-    todo("dns_codec.encode_name_uncompressed")
+// For a name outside a message, and for an RDATA field whose
+// specification forbids compression, which is every type defined after
+// RFC 1035.
+pub @tier(rt)
+fn encode_name_uncompressed(name: DnsName) -> [u8]
+    list.clone(name.wire)
 
 // Read the name at `offset`, following pointers.
 //
-// `message` is the WHOLE message, because a pointer is an offset from
+// `message` is the whole message, because a pointer is an offset from
 // its start and a reader handed only a slice cannot follow one.
 //
-// Two refusals are the point of this function.  A pointer that goes
-// forwards or sideways is `DnsForwardPointer`: § 4.1.4 only ever writes
-// a pointer to an EARLIER name, so that rule alone makes a loop
-// impossible and is cheaper than a visited set.  `DnsPointerLoop` is
-// the backstop for the hop count, which bounds the work even when the
-// first rule is somehow satisfied.
+// Two refusals keep a hostile message from looping.  A pointer that
+// goes forwards or at itself is `DnsForwardPointer`, because § 4.1.4
+// only ever writes a pointer to an earlier name.  A pointer that goes
+// backwards but lands inside the labels this walk has already read is
+// `DnsPointerLoop`, because following it would read them again.  With
+// both rules each pointer lands strictly before the last place the
+// walk started reading, so the walk ends.
+//
+// The walk also takes at most 255 steps, each a label, a pointer or
+// the terminator.  A name has at most 127 labels, so a walk that runs
+// out of steps has followed more pointers than a name has labels, and
+// that is `DnsPointerLoop` too.
 //
 // ```novo
 // use dns_codec
@@ -413,14 +777,52 @@ pub fn encode_name_uncompressed(name: DnsName) -> [u8]
 //         Err(e)  => println("bad name: ${e.message()}")
 //         Ok(got) => println("${dns_codec.name_label_count(got.name)} labels, resume at ${got.next}")
 // ```
-pub fn decode_name(message: [u8], offset: Int) -> Result<DnsNameRead, DnsCodecError>
-    todo("dns_codec.decode_name")
+pub @tier(rt)
+fn decode_name(message: [u8], offset: Int) -> Result<DnsNameRead, DnsCodecError>
+    var wire: [u8] = []
+    var pos = offset
+    var run_start = offset
+    var next = -1
+    for _ in 0..NAME_MAX
+        need(message, pos + 1)!
+        let b = message[pos] as Int
+        let tag = b & POINTER_TAG
+        if tag == POINTER_TAG
+            need(message, pos + 2)!
+            let target = ((b & 0x3F) << 8) | message[pos + 1] as Int
+            if target >= pos
+                return Err(DnsForwardPointer(pos, target))
+            if target >= run_start
+                return Err(DnsPointerLoop(pos))
+            if next < 0
+                next = pos + 2
+            pos = target
+            run_start = target
+        else if tag != 0
+            return Err(DnsReservedLabelBits(pos))
+        else if b == 0
+            wire = put8(wire, 0)
+            if next < 0
+                next = pos + 1
+            return Ok(DnsNameRead { name: DnsName { wire: wire }, next: next })
+        else
+            need(message, pos + 1 + b)!
+            wire = list.append(wire, list.slice(message, pos, pos + 1 + b))
+            if list.len(wire) + 1 > NAME_MAX
+                return Err(DnsNameTooLong(list.len(wire) + 1))
+            pos = pos + 1 + b
+    Err(DnsPointerLoop(pos))
 
 // ── Questions, records and messages ─────────────────────────────────
 
 // A question's bytes, at `offset` in the message being built.
-pub fn encode_question(c: DnsCompressor, question: DnsQuestion, offset: Int) -> DnsNameWrite
-    todo("dns_codec.encode_question")
+pub @tier(rt)
+fn encode_question(c: DnsCompressor, question: DnsQuestion, offset: Int) -> DnsNameWrite
+    let named = encode_name(c, question.name, offset)
+    var out = named.bytes[:]
+    out = put16(out, type_code(question.question_type))
+    out = put16(out, class_code(question.question_class))
+    DnsNameWrite { compressor: named.compressor, bytes: out }
 
 // A question and where the reader should carry on.
 pub struct DnsQuestionRead
@@ -428,59 +830,473 @@ pub struct DnsQuestionRead
     next: Int
 
 // Read the question at `offset` (§ 4.1.2).
-pub fn decode_question(message: [u8], offset: Int) -> Result<DnsQuestionRead, DnsCodecError>
-    todo("dns_codec.decode_question")
+pub @tier(rt)
+fn decode_question(message: [u8], offset: Int) -> Result<DnsQuestionRead, DnsCodecError>
+    let named = decode_name(message, offset)!
+    let at = named.next
+    need(message, at + 4)!
+    let question = DnsQuestion {
+        name: named.name,
+        question_type: type_of_code(get16(message, at)),
+        question_class: class_of_code(get16(message, at + 2)) }
+    Ok(DnsQuestionRead { question: question, next: at + 4 })
+
+// The type number a record's data is written under.
+@tier(rt)
+fn rdata_type(data: DnsRdata) -> Int
+    match data
+        RdataA(_)             => 1
+        RdataAaaa(_)          => 28
+        RdataCname(_)         => 5
+        RdataNs(_)            => 2
+        RdataPtr(_)           => 12
+        RdataMx(_)            => 15
+        RdataTxt(_)           => 16
+        RdataSrv(_)           => 33
+        RdataSoa(_)           => 6
+        RdataOpt(_)           => 41
+        RdataUnknown(code, _) => code
+
+// One TXT string, split into pieces of at most 255 bytes, each with its
+// length byte.  An empty string is one zero length byte.
+@tier(rt)
+fn put_txt(var out: [u8], s: [u8]) -> [u8]
+    let n = list.len(s)
+    if n == 0
+        out = put8(out, 0)
+        return out
+    let pieces = (n + 254) / 255
+    for p in 0..pieces
+        let lo = p * 255
+        let hi = min_int(lo + 255, n)
+        out = put8(out, hi - lo)
+        out = list.append(out, list.slice(s, lo, hi))
+    out
+
+// The MX data: the preference and the exchange, compressed.
+@tier(rt)
+fn encode_mx(c: DnsCompressor, mx: DnsMx, offset: Int) -> DnsNameWrite
+    var out: [u8] = []
+    out = put16(out, mx.preference)
+    let named = encode_name(c, mx.exchange, offset + 2)
+    out = list.append(out, named.bytes)
+    DnsNameWrite { compressor: named.compressor, bytes: out }
+
+// The SRV data: three numbers and the target, never compressed.
+@tier(rt)
+fn encode_srv(srv: DnsSrv) -> [u8]
+    var out: [u8] = []
+    out = put16(out, srv.priority)
+    out = put16(out, srv.weight)
+    out = put16(out, srv.port)
+    out = list.append(out, srv.target.wire)
+    out
+
+// The SOA data: two compressed names and five numbers.
+@tier(rt)
+fn encode_soa(c: DnsCompressor, soa: DnsSoa, offset: Int) -> DnsNameWrite
+    let primary = encode_name(c, soa.primary, offset)
+    let mailbox = encode_name(primary.compressor, soa.mailbox, offset + list.len(primary.bytes))
+    var out: [u8] = []
+    out = list.append(out, primary.bytes)
+    out = list.append(out, mailbox.bytes)
+    out = put32(out, soa.serial)
+    out = put32(out, soa.refresh)
+    out = put32(out, soa.retry)
+    out = put32(out, soa.expire)
+    out = put32(out, soa.minimum)
+    DnsNameWrite { compressor: mailbox.compressor, bytes: out }
+
+// The TXT data: each string with its length byte.
+@tier(rt)
+fn encode_txt(strings: [[u8]]) -> [u8]
+    var out: [u8] = []
+    for s in strings
+        out = put_txt(out, s)
+    out
+
+// The OPT data: each option as its code, its length and its bytes.
+@tier(rt)
+fn encode_options(options: [DnsOption]) -> [u8]
+    var out: [u8] = []
+    for o in options
+        out = put16(out, o.code)
+        out = put16(out, list.len(o.data))
+        out = list.append(out, o.data)
+    out
+
+// Bytes that need no compressor.
+@tier(rt)
+fn plain(c: DnsCompressor, bytes: [u8]) -> DnsNameWrite
+    DnsNameWrite { compressor: c, bytes: bytes }
+
+// The RDATA bytes of `data`, with its names compressed against `c` as
+// RFC 1035's own types allow, starting at `offset` in the message.
+@tier(rt)
+fn encode_rdata(c: DnsCompressor, data: DnsRdata, offset: Int) -> DnsNameWrite
+    match data
+        RdataA(octets)         => plain(c, list.clone(octets))
+        RdataAaaa(octets)      => plain(c, list.clone(octets))
+        RdataCname(target)     => encode_name(c, target, offset)
+        RdataNs(target)        => encode_name(c, target, offset)
+        RdataPtr(target)       => encode_name(c, target, offset)
+        RdataMx(mx)            => encode_mx(c, mx, offset)
+        RdataTxt(strings)      => plain(c, encode_txt(strings))
+        RdataSrv(srv)          => plain(c, encode_srv(srv))
+        RdataSoa(soa)          => encode_soa(c, soa, offset)
+        RdataOpt(options)      => plain(c, encode_options(options))
+        RdataUnknown(_, bytes) => plain(c, list.clone(bytes))
 
 // A record's bytes, at `offset` in the message being built.
 //
-// The RDLENGTH field is written after the RDATA is built, because it is
-// the RDATA's length and a two-pass encoder is the only way to get it
-// right for a type whose names compress.
-pub fn encode_record(c: DnsCompressor, record: DnsRecord, offset: Int) -> DnsNameWrite
-    todo("dns_codec.encode_record")
+// The RDATA is built first and its length written in front of it,
+// because a name compressed inside it makes the length unknowable
+// until it is written.  The names inside CNAME, NS, PTR, MX and SOA
+// data are compressed; SRV's target is written in full, as RFC 2782
+// requires.  Every number is written modulo its field's width.
+pub @tier(rt)
+fn encode_record(c: DnsCompressor, record: DnsRecord, offset: Int) -> DnsNameWrite
+    let named = encode_name(c, record.name, offset)
+    let rdata_at = offset + list.len(named.bytes) + 10
+    let rdata = encode_rdata(named.compressor, record.data, rdata_at)
+    var out = named.bytes[:]
+    out = put16(out, rdata_type(record.data))
+    out = put16(out, class_code(record.record_class))
+    out = put32(out, record.ttl)
+    out = put16(out, list.len(rdata.bytes))
+    out = list.append(out, rdata.bytes)
+    DnsNameWrite { compressor: rdata.compressor, bytes: out }
 
 // A record and where the reader should carry on.
 pub struct DnsRecordRead
     record: DnsRecord
     next: Int
 
+// A refusal unless a field that ended at `got` ends where the RDATA
+// does.
+@tier(rt)
+fn ends_at(start: Int, declared: Int, got: Int) -> Result<Int, DnsCodecError>
+    if got != start + declared
+        return Err(DnsRdataLengthMismatch(declared, got - start))
+    Ok(got)
+
+// A name inside RDATA that must fill it to its end.
+@tier(rt)
+fn rdata_name(message: [u8], start: Int, declared: Int) -> Result<DnsName, DnsCodecError>
+    let named = decode_name(message, start)!
+    ends_at(start, declared, named.next)!
+    Ok(named.name)
+
+// Fixed-length RDATA: exactly `width` bytes.
+@tier(rt)
+fn fixed(message: [u8], start: Int, declared: Int, width: Int) -> Result<[u8], DnsCodecError>
+    ends_at(start, declared, start + width)!
+    Ok(list.slice(message, start, start + width))
+
+// MX data: a preference and a name that ends the RDATA.
+@tier(rt)
+fn decode_mx(message: [u8], start: Int, declared: Int) -> Result<DnsRdata, DnsCodecError>
+    if declared < 3
+        return Err(DnsRdataLengthMismatch(declared, 3))
+    let exchange = rdata_name(message, start + 2, declared - 2)!
+    Ok(RdataMx(DnsMx { preference: get16(message, start), exchange: exchange }))
+
+// SRV data: three numbers and a name that ends the RDATA.
+@tier(rt)
+fn decode_srv(message: [u8], start: Int, declared: Int) -> Result<DnsRdata, DnsCodecError>
+    if declared < 7
+        return Err(DnsRdataLengthMismatch(declared, 7))
+    let target = rdata_name(message, start + 6, declared - 6)!
+    Ok(RdataSrv(DnsSrv {
+        priority: get16(message, start),
+        weight: get16(message, start + 2),
+        port: get16(message, start + 4),
+        target: target }))
+
+// SOA data: two names and five numbers that end the RDATA.
+@tier(rt)
+fn decode_soa(message: [u8], start: Int, declared: Int) -> Result<DnsRdata, DnsCodecError>
+    let primary = decode_name(message, start)!
+    let mailbox = decode_name(message, primary.next)!
+    let at = mailbox.next
+    ends_at(start, declared, at + 20)!
+    Ok(RdataSoa(DnsSoa {
+        primary: primary.name,
+        mailbox: mailbox.name,
+        serial: get32(message, at),
+        refresh: get32(message, at + 4),
+        retry: get32(message, at + 8),
+        expire: get32(message, at + 12),
+        minimum: get32(message, at + 16) }))
+
+// TXT data: length-prefixed strings that fill the RDATA exactly.
+@tier(rt)
+fn decode_txt(message: [u8], start: Int, declared: Int) -> Result<DnsRdata, DnsCodecError>
+    let end = start + declared
+    var strings: [[u8]] = []
+    var next = start
+    for pos in start..end
+        if pos == next
+            let n = message[pos] as Int
+            if pos + 1 + n > end
+                return Err(DnsRdataLengthMismatch(declared, pos + 1 + n - start))
+            strings = list.push(strings, list.slice(message, pos + 1, pos + 1 + n))
+            next = pos + 1 + n
+    Ok(RdataTxt(strings))
+
+// OPT data: options, each a code, a length and that many bytes, that
+// fill the RDATA exactly.
+@tier(rt)
+fn decode_options(message: [u8], start: Int, declared: Int) -> Result<DnsRdata, DnsCodecError>
+    let end = start + declared
+    var options: [DnsOption] = []
+    var next = start
+    for pos in start..end
+        if pos == next
+            if pos + 4 > end
+                return Err(DnsRdataLengthMismatch(declared, pos + 4 - start))
+            let n = get16(message, pos + 2)
+            if pos + 4 + n > end
+                return Err(DnsRdataLengthMismatch(declared, pos + 4 + n - start))
+            options = list.push(options, DnsOption {
+                code: get16(message, pos),
+                data: list.slice(message, pos + 4, pos + 4 + n) })
+            next = pos + 4 + n
+    Ok(RdataOpt(options))
+
+// The RDATA of type `kind`, `declared` bytes from `start`.  The caller
+// has checked that those bytes are in the message.
+@tier(rt)
+fn decode_rdata(message: [u8], kind: Int, start: Int,
+                declared: Int) -> Result<DnsRdata, DnsCodecError>
+    match kind
+        1  => Ok(RdataA(fixed(message, start, declared, 4)!))
+        28 => Ok(RdataAaaa(fixed(message, start, declared, 16)!))
+        5  => Ok(RdataCname(rdata_name(message, start, declared)!))
+        2  => Ok(RdataNs(rdata_name(message, start, declared)!))
+        12 => Ok(RdataPtr(rdata_name(message, start, declared)!))
+        15 => decode_mx(message, start, declared)
+        33 => decode_srv(message, start, declared)
+        6  => decode_soa(message, start, declared)
+        16 => decode_txt(message, start, declared)
+        41 => decode_options(message, start, declared)
+        _  => Ok(RdataUnknown(kind, list.slice(message, start, start + declared)))
+
 // Read the record at `offset` (§ 4.1.3).
 //
-// The RDLENGTH is checked against what the type's own parse consumed: a
-// record whose length field and contents disagree is
-// `DnsRdataLengthMismatch`, which is how a truncated AAAA is caught
-// rather than read as four bytes of address and twelve of the next
-// record.
-pub fn decode_record(message: [u8], offset: Int) -> Result<DnsRecordRead, DnsCodecError>
-    todo("dns_codec.decode_record")
+// The RDLENGTH is checked against what the type's own parse consumed.
+// A record whose length field and contents disagree is
+// `DnsRdataLengthMismatch`, which is how an AAAA whose RDLENGTH says 4
+// is caught rather than read as four bytes of address.  An RDLENGTH
+// that runs past the end of the message is `DnsTruncatedMessage`.  A
+// type this package does not model is kept as `RdataUnknown`.
+pub @tier(rt)
+fn decode_record(message: [u8], offset: Int) -> Result<DnsRecordRead, DnsCodecError>
+    let named = decode_name(message, offset)!
+    let at = named.next
+    need(message, at + 10)!
+    let kind = get16(message, at)
+    let declared = get16(message, at + 8)
+    let start = at + 10
+    need(message, start + declared)!
+    let data = decode_rdata(message, kind, start, declared)!
+    let record = DnsRecord {
+        name: named.name,
+        record_class: class_of_code(get16(message, at + 2)),
+        ttl: get32(message, at + 4),
+        data: data }
+    Ok(DnsRecordRead { record: record, next: start + declared })
+
+// A header with these flags and these four counts.
+@tier(rt)
+fn header_with(h: DnsHeader, flags: DnsFlags, qd: Int, an: Int, ns: Int, ar: Int) -> DnsHeader
+    DnsHeader {
+        id: h.id,
+        flags: flags,
+        question_count: qd,
+        answer_count: an,
+        authority_count: ns,
+        additional_count: ar }
+
+// The records of the three record sections, in wire order.
+@tier(rt)
+fn all_records(message: DnsMessage) -> [DnsRecord]
+    list.concat(list.concat(message.answers, message.authorities), message.additionals)
+
+// The header as the message value holds it and the question section,
+// with the compressor that remembers the question names.
+@tier(rt)
+fn encode_questions(message: DnsMessage) -> DnsNameWrite
+    var out: [u8] = encode_header(message.header)
+    var c = compressor()
+    for q in message.questions
+        let w = encode_question(c, q, list.len(out))
+        out = list.append(out, w.bytes)
+        c = w.compressor
+    DnsNameWrite { compressor: c, bytes: out }
+
+// The bytes with the header replaced.
+@tier(rt)
+fn with_header(wire: [u8], header: DnsHeader) -> [u8]
+    var out = encode_header(header)
+    out = list.append(out, list.slice(wire, HEADER_LEN, list.len(wire)))
+    out
+
+// The header of a message whose sections are all written.
+@tier(rt)
+fn counted_header(message: DnsMessage) -> DnsHeader
+    header_with(message.header, message.header.flags,
+                list.len(message.questions), list.len(message.answers),
+                list.len(message.authorities), list.len(message.additionals))
 
 // A whole message as its bytes, compressing names as it goes.
 //
 // The header's four counts are written from the lists' lengths rather
 // than from the header value, so a message whose header disagreed with
 // its own sections cannot be produced.
-pub fn encode_message(message: DnsMessage) -> [u8]
-    todo("dns_codec.encode_message")
+pub @tier(rt)
+fn encode_message(message: DnsMessage) -> [u8]
+    let head = encode_questions(message)
+    var out = head.bytes[:]
+    var c = head.compressor
+    for r in all_records(message)
+        let w = encode_record(c, r, list.len(out))
+        out = list.append(out, w.bytes)
+        c = w.compressor
+    with_header(out, counted_header(message))
+
+// The flags with the TC bit set.
+@tier(rt)
+fn truncated_flags(f: DnsFlags) -> DnsFlags
+    DnsFlags {
+        response: f.response,
+        opcode: f.opcode,
+        authoritative: f.authoritative,
+        truncated: true,
+        recursion_desired: f.recursion_desired,
+        recursion_available: f.recursion_available,
+        z: f.z,
+        authentic_data: f.authentic_data,
+        checking_disabled: f.checking_disabled,
+        rcode: f.rcode }
+
+// The smaller of two numbers.
+@tier(rt)
+fn min_int(a: Int, b: Int) -> Int
+    if a < b
+        return a
+    b
+
+// The header of a truncated response that kept its first `kept`
+// records.
+@tier(rt)
+fn truncated_header(message: DnsMessage, kept: Int) -> DnsHeader
+    let an = min_int(kept, list.len(message.answers))
+    let ns = min_int(kept - an, list.len(message.authorities))
+    header_with(message.header, truncated_flags(message.header.flags),
+                list.len(message.questions), an, ns, kept - an - ns)
 
 // A whole message as its bytes, truncated to fit a limit.
 //
-// What an authoritative server sends over UDP: if the message does not
-// fit in `limit` bytes, answers are dropped from the end, the TC bit is
-// set, and what comes back is a legal truncated response rather than a
-// refusal.  The question section is never dropped — a response that
-// does not echo its question is one a resolver cannot match — so a
-// limit too small for the header and the questions is
+// What an authoritative server sends over UDP.  A message that fits in
+// `limit` bytes is `encode_message`'s answer.  One that does not keeps
+// its records in wire order, answers then authority then additional,
+// for as long as they fit.  The first record that does not fit and
+// every record after it are dropped, the counts say what was kept, and
+// the TC bit is set.  The question section is never dropped, because a
+// response that does not echo its question is one a resolver cannot
+// match, so a limit too small for the header and the questions is
 // `DnsWouldTruncate`.
-pub fn encode_message_limited(message: DnsMessage, limit: Int) -> Result<[u8], DnsCodecError>
-    todo("dns_codec.encode_message_limited")
+pub @tier(rt)
+fn encode_message_limited(message: DnsMessage, limit: Int) -> Result<[u8], DnsCodecError>
+    let head = encode_questions(message)
+    if list.len(head.bytes) > limit
+        return Err(DnsWouldTruncate(list.len(head.bytes), limit))
+    var out = head.bytes[:]
+    var c = head.compressor
+    var kept = 0
+    for r in all_records(message)
+        let w = encode_record(c, r, list.len(out))
+        if list.len(out) + list.len(w.bytes) > limit
+            return Ok(with_header(out, truncated_header(message, kept)))
+        out = list.append(out, w.bytes)
+        c = w.compressor
+        kept = kept + 1
+    Ok(with_header(out, counted_header(message)))
+
+// A refusal when a section's next entry would start at the end of the
+// message: the header declared more than the bytes hold.
+@tier(rt)
+fn more_expected(bytes: [u8], at: Int, declared: Int, found: Int) -> Result<Int, DnsCodecError>
+    if at >= list.len(bytes)
+        return Err(DnsCountMismatch(declared, found))
+    Ok(at)
+
+// One section's records, and where the next section starts.
+struct DnsSectionRead
+    records: [DnsRecord]
+    next: Int
+
+// Read `count` records from `at`.
+@tier(rt)
+fn decode_section(bytes: [u8], at: Int, count: Int) -> Result<DnsSectionRead, DnsCodecError>
+    var records: [DnsRecord] = []
+    var pos = at
+    for i in 0..count
+        more_expected(bytes, pos, count, i)!
+        let got = decode_record(bytes, pos)!
+        records = list.push(records, got.record)
+        pos = got.next
+    Ok(DnsSectionRead { records: records, next: pos })
 
 // Read a whole message.
 //
-// Each section is read to the count its header declared, and a count
-// the bytes cannot satisfy is `DnsCountMismatch` — which is the check
-// that stops a malformed message from being read as a short one.
-pub fn decode_message(bytes: [u8]) -> Result<DnsMessage, DnsCodecError>
-    todo("dns_codec.decode_message")
+// Each section is read to the count its header declared.  A section
+// the bytes end inside is `DnsCountMismatch`, which stops a malformed
+// message from being read as a short one.  Bytes after the last
+// section are not read.
+//
+// ```novo
+// use dns_codec
+//
+// fn main() [io]
+//     // A response for example.com: one question, one A record whose
+//     // name is a pointer back to the question's name.
+//     let wire: [u8] = [0x12 as u8, 0x34 as u8, 0x81 as u8, 0x80 as u8,
+//                       0x00 as u8, 0x01 as u8, 0x00 as u8, 0x01 as u8,
+//                       0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+//                       0x07 as u8, 0x65 as u8, 0x78 as u8, 0x61 as u8,
+//                       0x6D as u8, 0x70 as u8, 0x6C as u8, 0x65 as u8,
+//                       0x03 as u8, 0x63 as u8, 0x6F as u8, 0x6D as u8,
+//                       0x00 as u8, 0x00 as u8, 0x01 as u8, 0x00 as u8,
+//                       0x01 as u8,
+//                       0xC0 as u8, 0x0C as u8, 0x00 as u8, 0x01 as u8,
+//                       0x00 as u8, 0x01 as u8, 0x00 as u8, 0x00 as u8,
+//                       0x0E as u8, 0x10 as u8, 0x00 as u8, 0x04 as u8,
+//                       0x5D as u8, 0xB8 as u8, 0xD8 as u8, 0x22 as u8]
+//     match dns_codec.decode_message(wire)
+//         Err(e)  => println("bad message: ${e.message()}")
+//         Ok(msg) => println("${list.len(msg.answers)} answer for ${dns_codec.name_text(msg.questions[0].name)}")
+// ```
+pub @tier(rt)
+fn decode_message(bytes: [u8]) -> Result<DnsMessage, DnsCodecError>
+    let header = decode_header(bytes)!
+    var questions: [DnsQuestion] = []
+    var pos = HEADER_LEN
+    for i in 0..header.question_count
+        more_expected(bytes, pos, header.question_count, i)!
+        let got = decode_question(bytes, pos)!
+        questions = list.push(questions, got.question)
+        pos = got.next
+    let answers = decode_section(bytes, pos, header.answer_count)!
+    let authorities = decode_section(bytes, answers.next, header.authority_count)!
+    let additionals = decode_section(bytes, authorities.next, header.additional_count)!
+    Ok(DnsMessage {
+        header: header,
+        questions: questions,
+        answers: answers.records,
+        authorities: authorities.records,
+        additionals: additionals.records })
 
 // ── EDNS0 (RFC 6891) ────────────────────────────────────────────────
 
@@ -488,9 +1304,9 @@ pub fn decode_message(bytes: [u8]) -> Result<DnsMessage, DnsCodecError>
 // than as a record's.
 //
 // The OPT record reuses CLASS as the requestor's UDP payload size and
-// TTL as an extended rcode, a version and a flags word.  That
-// reinterpretation is what this struct is; `opt_record` writes it and
-// `read_opt` reads it.
+// TTL as an extended rcode, a version and a flags word whose top bit is
+// DO.  That reinterpretation is what this struct is; `opt_record`
+// writes it and `read_opt` reads it.
 pub struct DnsOpt
     payload_size: Int
     extended_rcode: Int
@@ -503,101 +1319,142 @@ pub const EDNS_VERSION = 0
 
 // An OPT pseudo-record, for the additional section.
 //
-// Its name is always the root, which is the one rule about OPT that a
-// resolver written against RFC 1035 alone gets wrong.
-pub fn opt_record(opt: DnsOpt) -> DnsRecord
-    todo("dns_codec.opt_record")
+// Its name is always the root.  Its class is the payload size, which
+// reads back as `DnsClassOther` except for the three sizes that are
+// also class numbers.
+pub @tier(rt)
+fn opt_record(opt: DnsOpt) -> DnsRecord
+    let ttl = ((opt.extended_rcode & 0xFF) << 24)
+        | ((opt.version & 0xFF) << 16)
+        | bit_if(opt.dnssec_ok, 0x8000)
+    DnsRecord {
+        name: root_name(),
+        record_class: class_of_code(opt.payload_size & 0xFFFF),
+        ttl: ttl,
+        data: RdataOpt(list.clone(opt.options)) }
 
 // Read an OPT pseudo-record's EDNS0 fields.
 //
 // Refuses a record that is not an OPT, and one whose name is not the
-// root — both of which are messages a responder should answer
-// `DnsFormatError` to rather than parse.
-pub fn read_opt(record: DnsRecord) -> Result<DnsOpt, DnsCodecError>
-    todo("dns_codec.read_opt")
+// root, with `DnsBadOptRecord` (RFC 6891 § 6.1.1).  A responder answers
+// such a message `DnsFormatError` rather than parse it.
+pub @tier(rt)
+fn read_opt(record: DnsRecord) -> Result<DnsOpt, DnsCodecError>
+    if not name_eq(record.name, root_name())
+        return Err(DnsBadOptRecord)
+    match record.data
+        RdataOpt(options) =>
+            Ok(DnsOpt {
+                payload_size: class_code(record.record_class),
+                extended_rcode: (record.ttl >> 24) & 0xFF,
+                version: (record.ttl >> 16) & 0xFF,
+                dnssec_ok: (record.ttl & 0x8000) != 0,
+                options: options })
+        _                 => Err(DnsBadOptRecord)
 
 // The OPT record in a message's additional section, or `None`.
 //
 // There may be at most one, and a message with two is `DnsBadOptRecord`
 // rather than the first of them.
-pub fn find_opt(message: DnsMessage) -> Result<?DnsOpt, DnsCodecError>
-    todo("dns_codec.find_opt")
+pub @tier(rt)
+fn find_opt(message: DnsMessage) -> Result<?DnsOpt, DnsCodecError>
+    var found: ?DnsOpt = None
+    var seen = 0
+    for r in message.additionals
+        if rdata_type(r.data) == 41
+            seen = seen + 1
+            if seen > 1
+                return Err(DnsBadOptRecord)
+            found = Some(read_opt(r)!)
+    Ok(found)
 
-// The full twelve-bit rcode, the header's four bits with the OPT
+// The full twelve-bit rcode: the header's four bits with the OPT
 // record's upper eight in front.
 //
-// Separate from `DnsHeader.flags.rcode` because the two really are
-// different numbers: a responder with no EDNS0 sees `DnsNotImplemented`
-// where one with it sees BADVERS, and a caller that read only the
-// header would retry forever.
-pub fn extended_rcode(header: DnsHeader, opt: ?DnsOpt) -> Int
-    todo("dns_codec.extended_rcode")
+// Separate from `DnsHeader.flags.rcode` because the two are different
+// numbers.  BADVERS is 16, which is 0 in the header and 1 in the OPT
+// record, and a caller that read only the header would see no error.
+pub @tier(rt)
+fn extended_rcode(header: DnsHeader, opt: ?DnsOpt) -> Int
+    let low = rcode_code(header.flags.rcode)
+    match opt
+        None    => low
+        Some(o) => ((o.extended_rcode & 0xFF) << 4) | low
 
 // ── TCP framing (§ 4.2.2) ───────────────────────────────────────────
 //
 // Over TCP a message is preceded by its own two-byte big-endian length,
-// and a read of a socket returns whatever the network felt like giving
-// — a prefix of a length field, three messages, or one and a half.  The
-// state between "some bytes turned up" and "here is one message" is
-// this value: FEED it what the socket handed you, then DRAIN it until
-// it stops producing.
+// and a read of a socket returns whatever the network delivered: a
+// prefix of a length field, three messages, or one and a half.  The
+// state between "some bytes arrived" and "here is one message" is a
+// `DnsTcpReader`.  Feed it what the socket handed over, then take from
+// it until it stops producing.
 
 // Bytes received on one connection and not yet handed back as a
 // message.
 //
-// Opaque.  A caller that reaches into it has coupled itself to a
-// buffering decision this package intends to change; `tcp_pending_len`
-// is the fact a supervisor actually needs.
+// Treat it as opaque.  `tcp_pending_len` is the fact a supervisor
+// needs.
 pub struct DnsTcpReader
     pending: [u8]
 
 // A reader and the one message that came out of it, if one did.
 //
-// A struct rather than a tuple because a tuple's components come out
-// only through `match`, which reads badly for a value whose two halves
-// are used at different places — the caller reassigns one and parses
-// the other.
+// A struct rather than a tuple because the two halves are used at
+// different places: the caller reassigns one and parses the other.
 pub struct DnsTcpStep
     reader: DnsTcpReader
     message: ?[u8]
 
 // What a scan of a partial buffer concluded.
 //
-// Separate from `DnsCodecError` for the reason every streaming codec
-// separates the two: a message that has not all arrived is the normal
-// case on a socket, and an error type that also meant "wait" would make
-// every caller remember which value was which.
+// Separate from `DnsCodecError`: a message that has not all arrived is
+// the normal case on a socket, not an error.
 pub enum DnsTcpScan
     // The buffer holds a prefix: either the two length bytes are not
     // both there, or they are and the message is still arriving.
     DnsTcpPartial
-    // A whole message is at the front, `length` bytes INCLUDING the
+    // A whole message is at the front, `length` bytes including the
     // two-byte prefix.
     DnsTcpWhole(length: Int)
 
 // A message with its two-byte big-endian length in front.
-pub fn frame_tcp(message: [u8]) -> [u8]
-    todo("dns_codec.frame_tcp")
+//
+// The prefix is sixteen bits, so a message over 65,535 bytes cannot be
+// framed; its length is written modulo 65,536.
+pub @tier(rt)
+fn frame_tcp(message: [u8]) -> [u8]
+    var out: [u8] = []
+    out = put16(out, list.len(message))
+    out = list.append(out, message)
+    out
 
 // How much of the front of `buf` is one framed message.
-pub fn scan_tcp(buf: [u8]) -> DnsTcpScan
-    todo("dns_codec.scan_tcp")
+pub @tier(rt)
+fn scan_tcp(buf: [u8]) -> DnsTcpScan
+    if list.len(buf) < 2
+        return DnsTcpPartial
+    let whole = 2 + get16(buf, 0)
+    if list.len(buf) < whole
+        return DnsTcpPartial
+    DnsTcpWhole(whole)
 
 // A reader holding nothing.
-pub fn tcp_reader() -> DnsTcpReader
-    todo("dns_codec.tcp_reader")
+pub @tier(rt)
+fn tcp_reader() -> DnsTcpReader
+    DnsTcpReader { pending: [] }
 
 // Add bytes, and take a message if the addition completed one.
 //
-// Drains ONE message.  A read that completes two — which a socket of
-// any buffer size can return — leaves the second inside, and `take_tcp`
-// is what gets it.
+// Takes one message.  A read that completes two, which a socket of any
+// buffer size can return, leaves the second inside, and `take_tcp` is
+// what gets it.  The reader passed in is not changed.
 //
 // ```novo
 // use dns_codec
 //
-// // A socket handed us some bytes.  Feed them, take what came out, and
-// // keep taking — one read can finish two messages.
+// // A socket handed over some bytes.  Feed them, take what came out,
+// // and keep taking: one read can finish two messages.
 // fn drain(r: DnsTcpReader, chunk: [u8]) -> Int
 //     var cur = r
 //     var step = dns_codec.feed_tcp(cur, chunk)
@@ -612,26 +1469,35 @@ pub fn tcp_reader() -> DnsTcpReader
 //                 step = dns_codec.take_tcp(cur)
 //     seen
 // ```
-pub fn feed_tcp(reader: DnsTcpReader, bytes: [u8]) -> DnsTcpStep
-    todo("dns_codec.feed_tcp")
+pub @tier(rt)
+fn feed_tcp(reader: DnsTcpReader, bytes: [u8]) -> DnsTcpStep
+    take_tcp(DnsTcpReader { pending: list.concat(reader.pending, bytes) })
 
 // Take a message if a whole one is already buffered, adding nothing.
-pub fn take_tcp(reader: DnsTcpReader) -> DnsTcpStep
-    todo("dns_codec.take_tcp")
+pub @tier(rt)
+fn take_tcp(reader: DnsTcpReader) -> DnsTcpStep
+    match scan_tcp(reader.pending)
+        DnsTcpPartial      => DnsTcpStep { reader: reader, message: None }
+        DnsTcpWhole(whole) =>
+            let n = list.len(reader.pending)
+            let message = list.slice(reader.pending, 2, whole)
+            let rest = DnsTcpReader { pending: list.slice(reader.pending, whole, n) }
+            DnsTcpStep { reader: rest, message: Some(message) }
 
 // How many bytes the reader is holding.
 //
 // For a caller that bounds its own buffering: a peer that sends a
 // length prefix and then stops will be held forever, and this is how a
 // supervisor notices.
-pub fn tcp_pending_len(reader: DnsTcpReader) -> Int
-    todo("dns_codec.tcp_pending_len")
+pub @tier(rt)
+fn tcp_pending_len(reader: DnsTcpReader) -> Int
+    list.len(reader.pending)
 
 // ── Errors ──────────────────────────────────────────────────────────
 
 // Why a message could not be read or written.
 //
-// None of these means "wait for more bytes" — that is `DnsTcpPartial`.
+// None of these means "wait for more bytes"; that is `DnsTcpPartial`.
 pub enum DnsCodecError
     // Fewer bytes than the field being read needs.
     DnsTruncatedMessage(have: Int, need: Int)
@@ -639,16 +1505,20 @@ pub enum DnsCodecError
     DnsLabelTooLong(length: Int)
     // A name whose wire form exceeds 255 bytes.
     DnsNameTooLong(length: Int)
+    // An empty label in the middle of a name, at this index in the list
+    // of labels.  Only the root ends a name.
+    DnsEmptyLabel(index: Int)
     // A label length byte whose top two bits are 01 or 10, both of
     // which § 4.1.4 reserves.
     DnsReservedLabelBits(offset: Int)
-    // A pointer that points forwards or at itself.  § 4.1.4 only ever
-    // writes a pointer to an EARLIER name, so this rule alone makes a
-    // loop impossible.
+    // A pointer at `from` that points forwards or at itself.  § 4.1.4
+    // only ever writes a pointer to an earlier name.
     DnsForwardPointer(from: Int, to: Int)
-    // The hop count was exhausted — the backstop behind the rule above.
+    // A pointer at `offset` that points back into the labels the walk
+    // has already read, which would read them again without end, or a
+    // walk that followed more pointers than a name has labels.
     DnsPointerLoop(offset: Int)
-    // A section held fewer records than the header's count declared.
+    // A section held fewer entries than the header's count declared.
     DnsCountMismatch(declared: Int, found: Int)
     // A record's RDLENGTH and the bytes its type consumed disagree.
     DnsRdataLengthMismatch(declared: Int, actual: Int)
@@ -656,10 +1526,11 @@ pub enum DnsCodecError
     // more than one of them.
     DnsBadOptRecord
     // A limited encode whose header and question section alone do not
-    // fit — a response that does not echo its question is one a
+    // fit.  A response that does not echo its question is one a
     // resolver cannot match, so there is nothing to truncate to.
     DnsWouldTruncate(need: Int, limit: Int)
-    // A presentation-form name this package could not read.
+    // A presentation-form name this package could not read, with the
+    // offset of the fault.
     DnsBadNameText(offset: Int)
 
 // What went wrong, in words, for a caller that logs rather than
@@ -668,5 +1539,18 @@ pub enum DnsCodecError
 // `Result<_, DnsCodecError>` requires it: SPEC § 3.4 admits a `Result`
 // error type only if it implements `Error`.
 impl Error for DnsCodecError
+    @tier(rt)
     fn message(self) -> Str
-        todo("dns_codec.DnsCodecError.message")
+        match self
+            DnsTruncatedMessage(have, need)          => "the message is " + str.from_int(have) + " bytes and the field needs " + str.from_int(need)
+            DnsLabelTooLong(length)                  => "a label of " + str.from_int(length) + " bytes is longer than 63"
+            DnsNameTooLong(length)                   => "a name of " + str.from_int(length) + " bytes is longer than 255"
+            DnsEmptyLabel(index)                     => "label " + str.from_int(index) + " is empty"
+            DnsReservedLabelBits(offset)             => "the length byte at " + str.from_int(offset) + " uses the reserved bits"
+            DnsForwardPointer(from, to)              => "the pointer at " + str.from_int(from) + " points forwards to " + str.from_int(to)
+            DnsPointerLoop(offset)                   => "the pointer at " + str.from_int(offset) + " points back into the name it ends"
+            DnsCountMismatch(declared, found)        => "the header declares " + str.from_int(declared) + " entries and the message holds " + str.from_int(found)
+            DnsRdataLengthMismatch(declared, actual) => "the RDLENGTH is " + str.from_int(declared) + " and the data is " + str.from_int(actual) + " bytes"
+            DnsBadOptRecord                          => "the OPT record is not on the root name, or there is more than one"
+            DnsWouldTruncate(need, limit)            => "the header and questions need " + str.from_int(need) + " bytes and the limit is " + str.from_int(limit)
+            DnsBadNameText(offset)                   => "the name text is malformed at offset " + str.from_int(offset)
