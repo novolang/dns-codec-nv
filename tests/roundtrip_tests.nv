@@ -1,0 +1,164 @@
+// tests/roundtrip_tests.nv — properties over generated messages.
+//
+// A fixed-seed generator builds names, records and messages, and each
+// test states a property that must hold for every one of them.  Names
+// share suffixes on purpose, so compression is exercised on every
+// message.
+//
+//   decode(encode(m)) re-encodes to the same bytes.
+//   name_from_text(name_text(n)) is n, whatever bytes its labels hold.
+//   A framed stream split at any byte yields the same messages.
+
+use std.test
+use dns_codec
+
+// A linear congruential generator: the state and the next draw.
+struct Draw
+    seed: Int
+    value: Int
+
+fn draw(seed: Int, bound: Int) -> Draw
+    let next = (seed * 1103515245 + 12345) & 0x7FFFFFFF
+    Draw { seed: next, value: (next >> 8) % bound }
+
+// Whether two byte lists are equal.
+fn same(a: [u8], b: [u8]) -> Bool
+    if list.len(a) != list.len(b)
+        return false
+    for i in 0..list.len(a)
+        if a[i] != b[i]
+            return false
+    true
+
+// A generated name and the seed after it.
+struct NameDraw
+    seed: Int
+    name: DnsName
+
+fn gen_name(seed: Int) -> NameDraw
+    let suffixes = ["example.com", "example.org", "a.example.com", "local"]
+    let pick = draw(seed, list.len(suffixes))
+    let depth = draw(pick.seed, 3)
+    var s = depth.seed
+    var labels: [[u8]] = []
+    let alphabet: [u8] = [0x61 as u8, 0x62 as u8, 0x2E as u8, 0x20 as u8, 0x5C as u8, 0xFF as u8, 0x00 as u8, 0x41 as u8]
+    for i in 0..depth.value
+        let len = draw(s, 4)
+        s = len.seed
+        var chars: [u8] = []
+        for j in 0..len.value + 1
+            let d = draw(s, list.len(alphabet))
+            s = d.seed
+            chars = list.push(chars, alphabet[d.value])
+        labels = list.push(labels, chars)
+    match dns_codec.name_from_text(suffixes[pick.value])
+        Err(_)   => NameDraw { seed: s, name: dns_codec.root_name() }
+        Ok(tail) =>
+            labels = list.concat(labels, dns_codec.name_labels(tail))
+            match dns_codec.name_of_labels(labels)
+                Ok(n)  => NameDraw { seed: s, name: n }
+                Err(_) => NameDraw { seed: s, name: tail }
+
+// A generated record and the seed after it.
+struct RecordDraw
+    seed: Int
+    record: DnsRecord
+
+fn gen_record(seed: Int) -> RecordDraw
+    let owner = gen_name(seed)
+    let target = gen_name(owner.seed)
+    let kind = draw(target.seed, 9)
+    let s = kind.seed
+    let t = target.name
+    let data = match kind.value
+        0 => RdataA([10 as u8, 0 as u8, 0 as u8, (s & 0xFF) as u8])
+        1 => RdataAaaa([0x20 as u8, 0x01 as u8, 0x0D as u8, 0xB8 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+                        0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, (s & 0xFF) as u8])
+        2 => RdataCname(t)
+        3 => RdataNs(t)
+        4 => RdataPtr(t)
+        5 => RdataMx(DnsMx { preference: s & 0xFFFF, exchange: t })
+        6 => RdataTxt([t.wire, [0x78 as u8]])
+        7 => RdataSrv(DnsSrv { priority: s & 0xFF, weight: (s >> 8) & 0xFF, port: s & 0xFFFF, target: t })
+        _ => RdataSoa(DnsSoa { primary: t, mailbox: owner.name, serial: s, refresh: 1, retry: 2,
+                               expire: 3, minimum: 4 })
+    RecordDraw { seed: s, record: DnsRecord { name: owner.name, record_class: DnsClassInternet,
+                                              ttl: s & 0xFFFFFF, data: data } }
+
+// A generated message with one question and up to four records in each
+// section.
+fn gen_message(seed: Int) -> DnsMessage
+    let q = gen_name(seed)
+    var s = q.seed
+    var sections: [[DnsRecord]] = []
+    for k in 0..3
+        let n = draw(s, 5)
+        s = n.seed
+        var records: [DnsRecord] = []
+        for i in 0..n.value
+            let r = gen_record(s)
+            s = r.seed
+            records = list.push(records, r.record)
+        sections = list.push(sections, records)
+    DnsMessage {
+        header: DnsHeader { id: s & 0xFFFF, flags: dns_codec.decode_flags(s & 0xFFFF),
+                            question_count: 1, answer_count: 0, authority_count: 0,
+                            additional_count: 0 },
+        questions: [DnsQuestion { name: q.name, question_type: DnsTypeA, question_class: DnsClassInternet }],
+        answers: sections[0],
+        authorities: sections[1],
+        additionals: sections[2] }
+
+@test
+fn test_a_decoded_message_re_encodes_to_the_same_bytes()
+    for seed in 1..101
+        let wire = dns_codec.encode_message(gen_message(seed))
+        match dns_codec.decode_message(wire)
+            Err(e)   => test.fail("seed ${seed}: ${e.message()}")
+            Ok(back) => test.assert(same(dns_codec.encode_message(back), wire))
+
+@test
+fn test_a_name_survives_its_presentation_form()
+    var s = 7
+    for i in 0..200
+        let n = gen_name(s)
+        s = n.seed
+        match dns_codec.name_from_text(dns_codec.name_text(n.name))
+            Err(e)   => test.fail("${dns_codec.name_text(n.name)}: ${e.message()}")
+            Ok(back) => test.assert(same(back.wire, n.name.wire))
+
+@test
+fn test_a_stream_split_anywhere_gives_back_the_same_messages()
+    let one = dns_codec.encode_message(gen_message(3))
+    let two = dns_codec.encode_message(gen_message(4))
+    let stream = list.concat(dns_codec.frame_tcp(one), dns_codec.frame_tcp(two))
+    for cut in 0..list.len(stream) + 1
+        var r = dns_codec.tcp_reader()
+        var got: [[u8]] = []
+        let first = dns_codec.feed_tcp(r, list.slice(stream, 0, cut))
+        r = first.reader
+        if let Some(m) = first.message
+            got = list.push(got, m[:])
+        var step = dns_codec.feed_tcp(r, list.slice(stream, cut, list.len(stream)))
+        for k in 0..3
+            if let Some(m) = step.message
+                got = list.push(got, m[:])
+                step = dns_codec.take_tcp(step.reader)
+        test.assert_eq(list.len(got), 2)
+        test.assert(same(got[0], one))
+        test.assert(same(got[1], two))
+        test.assert_eq(dns_codec.tcp_pending_len(step.reader), 0)
+
+@test
+fn test_a_limited_encode_is_always_a_legal_message()
+    for seed in 1..41
+        let msg = gen_message(seed)
+        let whole = list.len(dns_codec.encode_message(msg))
+        for limit in [whole, whole - 1, whole / 2, 60]
+            match dns_codec.encode_message_limited(msg, limit)
+                Err(_)   => test.assert(limit < 12 + 4 + 255)
+                Ok(wire) =>
+                    test.assert(list.len(wire) <= limit)
+                    match dns_codec.decode_message(wire)
+                        Err(e) => test.fail("seed ${seed} limit ${limit}: ${e.message()}")
+                        Ok(_)  => test.assert(true)

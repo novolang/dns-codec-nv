@@ -1,0 +1,755 @@
+// tests/wire_tests.nv — whole messages, byte for byte, and the refusals.
+//
+// Each vector below is written out as hex and was checked by hand
+// against RFC 1035 § 4.1, RFC 2782, RFC 3596 and RFC 6891 § 6.1.  The
+// queries are the shape `dig` sends: recursion desired, the AD bit, and
+// an OPT record advertising 1232 bytes with a cookie option.  The
+// responses compress every name the way a real responder does, so
+// re-encoding a decoded message has to reproduce the exact bytes.
+
+use std.test
+use std.str
+use dns_codec
+
+// The value of one hex digit, or -1.
+fn nibble(c: Int) -> Int
+    if c >= '0' and c <= '9'
+        return c - '0'
+    if c >= 'a' and c <= 'f'
+        return c - 'a' + 10
+    if c >= 'A' and c <= 'F'
+        return c - 'A' + 10
+    -1
+
+// The bytes a hex string spells, ignoring spaces.
+fn hex(s: Str) -> [u8]
+    var out: [u8] = []
+    var high = -1
+    for i in 0..str.len(s)
+        let v = nibble(str.byte_at_or(s, i, 0))
+        if v >= 0
+            if high < 0
+                high = v
+            else
+                out = list.push(out, (high * 16 + v) as u8)
+                high = -1
+    out
+
+// Whether two byte lists are equal.
+fn same(a: [u8], b: [u8]) -> Bool
+    if list.len(a) != list.len(b)
+        return false
+    for i in 0..list.len(a)
+        if a[i] != b[i]
+            return false
+    true
+
+fn name(text: Str) -> DnsName
+    match dns_codec.name_from_text(text)
+        Ok(n)  => n
+        Err(_) => dns_codec.root_name()
+
+fn flags(word: Int) -> DnsFlags
+    dns_codec.decode_flags(word)
+
+fn header(id: Int, word: Int) -> DnsHeader
+    DnsHeader { id: id, flags: flags(word), question_count: 0, answer_count: 0,
+                authority_count: 0, additional_count: 0 }
+
+fn record(owner: Str, ttl: Int, data: DnsRdata) -> DnsRecord
+    DnsRecord { name: name(owner), record_class: DnsClassInternet, ttl: ttl, data: data }
+
+fn question(text: Str, kind: DnsType) -> DnsQuestion
+    DnsQuestion { name: name(text), question_type: kind, question_class: DnsClassInternet }
+
+// The query `dig example.com` sends: id 0x1234, RD and AD, one
+// question, and an OPT record of payload 1232 carrying an eight-byte
+// client cookie (RFC 7873, option code 10).
+fn dig_query() -> [u8]
+    hex("1234 0120 0001 0000 0000 0001"
+        + " 07 6578616d706c65 03 636f6d 00 0001 0001"
+        + " 00 0029 04d0 00000000 000c 000a 0008 0102030405060708")
+
+// A response for www.example.com: a CNAME to example.com and the A
+// record for it.  Every owner name and the CNAME target are pointers.
+//
+//   12  03 www 07 example 03 com 00      the question's name
+//   16  07 example 03 com 00             pointed at twice
+//   33  C0 0C CNAME IN 300 len 2 C0 10
+//   47  C0 10 A IN 300 len 4 93.184.216.34
+fn cname_response() -> [u8]
+    hex("abcd 8180 0001 0002 0000 0000"
+        + " 03 777777 07 6578616d706c65 03 636f6d 00 0001 0001"
+        + " c00c 0005 0001 0000012c 0002 c010"
+        + " c010 0001 0001 0000012c 0004 5db8d822")
+
+@test
+fn test_a_dig_query_decodes_field_by_field()
+    match dns_codec.decode_message(dig_query())
+        Err(e)  => test.fail("the query is well formed: ${e.message()}")
+        Ok(msg) =>
+            test.assert_eq(msg.header.id, 0x1234)
+            test.assert(msg.header.flags.recursion_desired)
+            test.assert(msg.header.flags.authentic_data)
+            test.assert(not msg.header.flags.response)
+            test.assert_eq(list.len(msg.questions), 1)
+            test.assert_eq(dns_codec.name_text(msg.questions[0].name), "example.com.")
+            test.assert_eq(list.len(msg.additionals), 1)
+            match dns_codec.find_opt(msg)
+                Err(_)    => test.fail("one OPT record")
+                Ok(found) =>
+                    match found
+                        None      => test.fail("the OPT record is there")
+                        Some(opt) =>
+                            test.assert_eq(opt.payload_size, 1232)
+                            test.assert_eq(opt.version, 0)
+                            test.assert(not opt.dnssec_ok)
+                            test.assert_eq(list.len(opt.options), 1)
+                            test.assert_eq(opt.options[0].code, 10)
+                            test.assert_eq(list.len(opt.options[0].data), 8)
+
+@test
+fn test_a_dig_query_re_encodes_to_the_same_bytes()
+    match dns_codec.decode_message(dig_query())
+        Err(_)  => test.fail("the query is well formed")
+        Ok(msg) => test.assert(same(dns_codec.encode_message(msg), dig_query()))
+
+@test
+fn test_a_compressed_response_decodes_its_pointers()
+    match dns_codec.decode_message(cname_response())
+        Err(e)  => test.fail("the response is well formed: ${e.message()}")
+        Ok(msg) =>
+            test.assert(msg.header.flags.response)
+            test.assert(msg.header.flags.recursion_available)
+            test.assert_eq(list.len(msg.answers), 2)
+            test.assert_eq(dns_codec.name_text(msg.answers[0].name), "www.example.com.")
+            test.assert_eq(msg.answers[0].ttl, 300)
+            match msg.answers[0].data
+                RdataCname(target) => test.assert_eq(dns_codec.name_text(target), "example.com.")
+                _                  => test.fail("the first answer is a CNAME")
+            test.assert_eq(dns_codec.name_text(msg.answers[1].name), "example.com.")
+            match msg.answers[1].data
+                RdataA(octets) =>
+                    test.assert_eq(octets[0] as Int, 93)
+                    test.assert_eq(octets[3] as Int, 34)
+                _              => test.fail("the second answer is an A record")
+
+@test
+fn test_a_compressed_response_re_encodes_to_the_same_bytes()
+    // The encoder makes the same choices a real responder made: the
+    // owner names and the CNAME target all become pointers.
+    match dns_codec.decode_message(cname_response())
+        Err(_)  => test.fail("the response is well formed")
+        Ok(msg) => test.assert(same(dns_codec.encode_message(msg), cname_response()))
+
+@test
+fn test_a_response_built_from_values_is_the_captured_bytes()
+    var h = header(0xABCD, 0x8180)
+    let msg = DnsMessage {
+        header: h,
+        questions: [question("www.example.com", DnsTypeA)],
+        answers: [record("www.example.com", 300, RdataCname(name("example.com"))),
+                  record("example.com", 300, RdataA([93 as u8, 184 as u8, 216 as u8, 34 as u8]))],
+        authorities: [],
+        additionals: [] }
+    test.assert(same(dns_codec.encode_message(msg), cname_response()))
+
+// A record of each modelled type, round-tripped through a message.
+fn every_type() -> DnsMessage
+    let soa = DnsSoa { primary: name("ns1.example.com"), mailbox: name("hostmaster.example.com"),
+                       serial: 2026092701, refresh: 7200, retry: 3600, expire: 1209600,
+                       minimum: 300 }
+    let aaaa: [u8] = hex("20010db8000000000000000000000001")
+    DnsMessage {
+        header: header(7, 0x8400),
+        questions: [question("example.com", DnsTypeAny)],
+        answers: [record("example.com", 60, RdataA([192 as u8, 0 as u8, 2 as u8, 1 as u8])),
+                  record("example.com", 60, RdataAaaa(aaaa)),
+                  record("example.com", 60, RdataNs(name("ns1.example.com"))),
+                  record("example.com", 60, RdataMx(DnsMx { preference: 10, exchange: name("mail.example.com") })),
+                  record("example.com", 60, RdataTxt([hex("763d7370663120")])),
+                  record("_sip._udp.example.com",
+        60,
+        RdataSrv(DnsSrv { priority: 1, weight: 2, port: 5060, target: name("sip.example.com") })),
+                  record("1.2.0.192.in-addr.arpa", 60, RdataPtr(name("example.com"))),
+                  record("example.com", 60, RdataSoa(soa)),
+                  record("example.com", 60, RdataUnknown(99, [0x01 as u8]))],
+        authorities: [],
+        additionals: [dns_codec.opt_record(DnsOpt { payload_size: 4096, extended_rcode: 0,
+                                                    version: 0, dnssec_ok: true, options: [] })] }
+
+@test
+fn test_every_modelled_type_round_trips()
+    let wire = dns_codec.encode_message(every_type())
+    match dns_codec.decode_message(wire)
+        Err(e)   => test.fail("what encode wrote, decode reads: ${e.message()}")
+        Ok(back) =>
+            test.assert_eq(list.len(back.answers), 9)
+            test.assert(same(dns_codec.encode_message(back), wire))
+            match back.answers[1].data
+                RdataAaaa(octets) =>
+                    test.assert_eq(list.len(octets), 16)
+                    test.assert_eq(octets[15] as Int, 1)
+                _                 => test.fail("the second answer is AAAA")
+            match back.answers[2].data
+                RdataNs(target) => test.assert_eq(dns_codec.name_text(target), "ns1.example.com.")
+                _               => test.fail("the third answer is NS")
+            match back.answers[3].data
+                RdataMx(mx) =>
+                    test.assert_eq(mx.preference, 10)
+                    test.assert_eq(dns_codec.name_text(mx.exchange), "mail.example.com.")
+                _           => test.fail("the fourth answer is MX")
+            match back.answers[4].data
+                RdataTxt(strings) =>
+                    test.assert_eq(list.len(strings), 1)
+                    test.assert_eq(list.len(strings[0]), 7)
+                _                 => test.fail("the fifth answer is TXT")
+            match back.answers[5].data
+                RdataSrv(srv) =>
+                    test.assert_eq(srv.priority, 1)
+                    test.assert_eq(srv.weight, 2)
+                    test.assert_eq(srv.port, 5060)
+                    test.assert_eq(dns_codec.name_text(srv.target), "sip.example.com.")
+                _             => test.fail("the sixth answer is SRV")
+            match back.answers[6].data
+                RdataPtr(target) => test.assert_eq(dns_codec.name_text(target), "example.com.")
+                _                => test.fail("the seventh answer is PTR")
+            match back.answers[7].data
+                RdataSoa(soa) =>
+                    test.assert_eq(dns_codec.name_text(soa.mailbox), "hostmaster.example.com.")
+                    test.assert_eq(soa.serial, 2026092701)
+                    test.assert_eq(soa.refresh, 7200)
+                    test.assert_eq(soa.retry, 3600)
+                    test.assert_eq(soa.expire, 1209600)
+                    test.assert_eq(soa.minimum, 300)
+                _             => test.fail("the eighth answer is SOA")
+            match back.answers[8].data
+                RdataUnknown(code, bytes) =>
+                    test.assert_eq(code, 99)
+                    test.assert_eq(list.len(bytes), 1)
+                _                         => test.fail("type 99 is kept as its bytes")
+            match dns_codec.find_opt(back)
+                Ok(found) =>
+                    match found
+                        Some(opt) =>
+                            test.assert_eq(opt.payload_size, 4096)
+                            test.assert(opt.dnssec_ok)
+                        None      => test.fail("the OPT record survives")
+                Err(_)    => test.fail("one OPT record")
+
+@test
+fn test_an_srv_target_is_never_compressed_and_an_mx_exchange_is()
+    // RFC 2782 forbids compressing the SRV target; RFC 1035's MX may be.
+    let msg = DnsMessage {
+        header: header(1, 0x8000),
+        questions: [question("example.com", DnsTypeMx)],
+        answers: [record("example.com", 60, RdataMx(DnsMx { preference: 5, exchange: name("example.com") })),
+                  record("example.com",
+        60,
+        RdataSrv(DnsSrv { priority: 0, weight: 0, port: 1, target: name("example.com") }))],
+        authorities: [],
+        additionals: [] }
+    let wire = dns_codec.encode_message(msg)
+    // Question 12..28 (13 + 4).  MX record: pointer 2 + 10 + preference 2
+    // + pointer 2 = 16, ending at 45.  SRV record: pointer 2 + 10 + 6 + 13.
+    test.assert_eq(list.len(wire), 12 + 17 + 16 + 31)
+    test.assert_eq(wire[43] as Int, 0xC0)
+    test.assert_eq(wire[63] as Int, 7)
+
+// ── Names ───────────────────────────────────────────────────────────
+
+@test
+fn test_presentation_form_escapes_what_is_not_a_plain_character()
+    // A label holding a dot, a space, a backslash and an at sign, and a
+    // byte above the ASCII range.
+    let label: [u8] = [0x61 as u8, 0x2E as u8, 0x20 as u8, 0x5C as u8, 0x40 as u8, 0xE9 as u8]
+    match dns_codec.name_of_labels([label, [0x63 as u8]])
+        Err(_) => test.fail("two labels are a name")
+        Ok(nm) =>
+            let text = dns_codec.name_text(nm)
+            test.assert_eq(text, "a\\.\\032\\\\\\@\\233.c.")
+            match dns_codec.name_from_text(text)
+                Err(_)   => test.fail("the escaped form reads back")
+                Ok(back) => test.assert(same(back.wire, nm.wire))
+
+@test
+fn test_every_special_character_is_escaped_and_reads_back()
+    let label: [u8] = [0x22 as u8, 0x28 as u8, 0x29 as u8, 0x3B as u8, 0x24 as u8, 0x7F as u8, 0x00 as u8]
+    match dns_codec.name_of_labels([label])
+        Err(_) => test.fail("one label is a name")
+        Ok(nm) =>
+            let text = dns_codec.name_text(nm)
+            test.assert_eq(text, "\\\"\\(\\)\\;\\$\\127\\000.")
+            match dns_codec.name_from_text(text)
+                Err(_)   => test.fail("the escaped form reads back")
+                Ok(back) => test.assert(same(back.wire, nm.wire))
+
+@test
+fn test_text_reads_a_trailing_dot_and_the_root()
+    test.assert(same(name("example.com.").wire, name("example.com").wire))
+    match dns_codec.name_from_text(".")
+        Ok(root) => test.assert_eq(list.len(root.wire), 1)
+        Err(_)   => test.fail("a lone dot is the root")
+    // An escape of a plain character is that character.
+    test.assert(same(name("\\a\\b").wire, name("ab").wire))
+
+@test
+fn test_malformed_text_is_refused_with_its_offset()
+    let bad = ["", "a..b", ".a", "a\\", "a\\25", "a\\2x5", "a\\256"]
+    let at = [0, 2, 0, 1, 1, 1, 1]
+    for i in 0..list.len(bad)
+        match dns_codec.name_from_text(bad[i])
+            Ok(_)  => test.fail("'${bad[i]}' is not a name")
+            Err(e) =>
+                match e
+                    DnsBadNameText(offset) => test.assert_eq(offset, at[i])
+                    _                      => test.fail("'${bad[i]}' is DnsBadNameText")
+
+@test
+fn test_text_past_the_limits_is_refused()
+    var long = ""
+    for i in 0..64
+        long = long + "a"
+    match dns_codec.name_from_text(long + ".com")
+        Ok(_)  => test.fail("a 64-byte label is too long")
+        Err(e) =>
+            match e
+                DnsLabelTooLong(n) => test.assert_eq(n, 64)
+                _                  => test.fail("the refusal names the label length")
+    match dns_codec.name_from_text("com." + long)
+        Ok(_)  => test.fail("the last label is checked too")
+        Err(e) =>
+            match e
+                DnsLabelTooLong(n) => test.assert_eq(n, 64)
+                _                  => test.fail("the refusal names the label length")
+    let label63 = str.slice(long, 0, 63)
+    let five = label63 + "." + label63 + "." + label63 + "." + label63 + "." + label63
+    match dns_codec.name_from_text(five)
+        Ok(_)  => test.fail("five 63-byte labels are 321 wire bytes")
+        Err(e) =>
+            match e
+                DnsNameTooLong(n) => test.assert_eq(n, 321)
+                _                 => test.fail("the refusal names the wire length")
+
+@test
+fn test_labels_past_the_limits_are_refused()
+    let label: [u8] = list.map(0..63, i => 0x61 as u8)
+    match dns_codec.name_of_labels([label, label, label, label, label])
+        Ok(_)  => test.fail("321 wire bytes is too long")
+        Err(e) =>
+            match e
+                DnsNameTooLong(n) => test.assert_eq(n, 321)
+                _                 => test.fail("the refusal names the wire length")
+    match dns_codec.name_of_labels([label, []])
+        Ok(_)  => test.fail("an empty label ends a name early")
+        Err(e) =>
+            match e
+                DnsEmptyLabel(index) => test.assert_eq(index, 1)
+                _                    => test.fail("the refusal names the label")
+    match dns_codec.name_of_labels([])
+        Ok(root) => test.assert_eq(list.len(root.wire), 1)
+        Err(_)   => test.fail("no labels is the root")
+
+@test
+fn test_the_labels_of_a_name_are_its_bytes()
+    let labels = dns_codec.name_labels(name("mail.example.com"))
+    test.assert_eq(list.len(labels), 3)
+    test.assert_eq(list.len(labels[0]), 4)
+    test.assert_eq(labels[2][0] as Int, 'c')
+    // A hand-built wire form with no terminator is read as far as it
+    // goes.
+    let open = DnsName { wire: [0x01 as u8, 0x61 as u8] }
+    test.assert_eq(dns_codec.name_label_count(open), 1)
+
+@test
+fn test_names_of_different_lengths_are_not_equal()
+    test.assert(not dns_codec.name_eq(name("example.com"), name("example.co")))
+    test.assert(not dns_codec.name_eq(name("example.com"), name("exbmple.com")))
+    test.assert(dns_codec.name_eq(name("Example.COM"), name("example.com")))
+
+// ── Compression ─────────────────────────────────────────────────────
+
+@test
+fn test_a_pointer_back_into_the_name_being_read_is_a_loop()
+    // `01 'a' C0 00`: the label at 0, then a pointer at 2 back to 0.
+    // Following it would read `a` again for ever.
+    let looped: [u8] = [0x01 as u8, 0x61 as u8, 0xC0 as u8, 0x00 as u8]
+    match dns_codec.decode_name(looped, 0)
+        Ok(_)  => test.fail("the name never ends")
+        Err(e) =>
+            match e
+                DnsPointerLoop(offset) => test.assert_eq(offset, 2)
+                _                      => test.fail("the refusal names the pointer")
+
+// A message whose last two bytes are a pointer, each pointer pointing
+// at the one before it, and the first at a root at offset 0.
+fn pointer_chain(n: Int) -> [u8]
+    var out: [u8] = [0x00 as u8]
+    for k in 0..n
+        var target = 0
+        if k > 0
+            target = 1 + 2 * (k - 1)
+        out = list.push(out, (0xC0 | (target >> 8)) as u8)
+        out = list.push(out, (target & 0xFF) as u8)
+    out
+
+@test
+fn test_a_chain_of_pointers_ends_or_is_refused_by_its_length()
+    // Each pointer goes backwards, so neither rule refuses the chain.
+    // A hundred of them resolve to the root; three hundred are more
+    // steps than a name of 127 labels could ever need.
+    match dns_codec.decode_name(pointer_chain(100), 1 + 2 * 99)
+        Err(_)  => test.fail("a hundred backward pointers end at the root")
+        Ok(got) =>
+            test.assert_eq(list.len(got.name.wire), 1)
+            test.assert_eq(got.next, 1 + 2 * 99 + 2)
+    match dns_codec.decode_name(pointer_chain(300), 1 + 2 * 299)
+        Ok(_)  => test.fail("three hundred pointers are refused")
+        Err(e) =>
+            match e
+                DnsPointerLoop(_) => test.assert(true)
+                _                 => test.fail("an endless-looking walk is DnsPointerLoop")
+
+@test
+fn test_a_name_that_runs_off_the_end_is_truncated()
+    // The offset is past the end; a pointer has one byte; a label
+    // claims three bytes and has two.
+    let cases: [[u8]] = [[0x00 as u8], [0x00 as u8, 0xC0 as u8], [0x03 as u8, 0x61 as u8, 0x62 as u8]]
+    let offsets = [4, 1, 0]
+    let needs = [5, 3, 4]
+    for i in 0..3
+        match dns_codec.decode_name(cases[i], offsets[i])
+            Ok(_)  => test.fail("case ${i} runs off the end")
+            Err(e) =>
+                match e
+                    DnsTruncatedMessage(have, need) =>
+                        test.assert_eq(have, list.len(cases[i]))
+                        test.assert_eq(need, needs[i])
+                    _                               => test.fail("case ${i} is DnsTruncatedMessage")
+
+@test
+fn test_a_name_that_expands_past_255_bytes_is_refused()
+    // Five 63-byte labels in a row: each label is legal and the name
+    // they spell is not.
+    var m: [u8] = []
+    for k in 0..5
+        m = list.push(m, 63 as u8)
+        m = list.append(m, list.map(0..63, j => 0x61 as u8))
+    m = list.push(m, 0x00 as u8)
+    match dns_codec.decode_name(m, 0)
+        Ok(_)  => test.fail("321 bytes is too long")
+        Err(e) =>
+            match e
+                DnsNameTooLong(n) => test.assert(n > 255)
+                _                 => test.fail("the refusal names the length")
+
+@test
+fn test_a_compressor_is_a_value_and_its_old_copy_is_unchanged()
+    let c = dns_codec.compressor()
+    let first = dns_codec.encode_name(c, name("example.com"), 12)
+    test.assert_eq(list.len(c.entries), 0)
+    test.assert_eq(list.len(first.compressor.entries), 2)
+    // A different name that shares the suffix points at `com`.
+    let second = dns_codec.encode_name(first.compressor, name("example.org"), 25)
+    test.assert_eq(list.len(second.bytes), 13)
+    let third = dns_codec.encode_name(second.compressor, name("mail.example.com"), 38)
+    test.assert_eq(list.len(third.bytes), 5 + 2)
+    test.assert_eq(third.bytes[6] as Int, 12)
+
+@test
+fn test_a_name_past_the_pointer_reach_is_not_remembered()
+    let far = dns_codec.encode_name(dns_codec.compressor(), name("example.com"), 0x4000)
+    test.assert_eq(list.len(far.compressor.entries), 0)
+    let near = dns_codec.encode_name(dns_codec.compressor(), name("example.com"), 0x3FFF)
+    test.assert_eq(list.len(near.compressor.entries), 1)
+
+// ── Records ─────────────────────────────────────────────────────────
+
+// A record at offset 0 with the root as its owner: type, class IN,
+// TTL 0, and the given RDLENGTH and RDATA.
+fn raw_record(kind: Int, rdata: [u8]) -> [u8]
+    var out: [u8] = [0x00 as u8, (kind >> 8) as u8, (kind & 0xFF) as u8, 0x00 as u8, 0x01 as u8,
+                     0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+                     (list.len(rdata) >> 8) as u8, (list.len(rdata) & 0xFF) as u8]
+    list.concat(out, rdata)
+
+// Whether a decode was refused with a length mismatch.
+fn is_mismatch(r: Result<DnsRecordRead, DnsCodecError>) -> Bool
+    match r
+        Ok(_)  => false
+        Err(e) =>
+            match e
+                DnsRdataLengthMismatch(_, _) => true
+                _                            => false
+
+@test
+fn test_rdata_whose_length_disagrees_with_its_type_is_refused()
+    test.assert(is_mismatch(dns_codec.decode_record(raw_record(1, hex("0102030405")), 0)))
+    test.assert(is_mismatch(dns_codec.decode_record(raw_record(28, hex("01020304")), 0)))
+    test.assert(is_mismatch(dns_codec.decode_record(raw_record(15, hex("0001")), 0)))
+    test.assert(is_mismatch(dns_codec.decode_record(raw_record(33, hex("000100020003")), 0)))
+    // A CNAME whose name ends before its RDATA does.
+    test.assert(is_mismatch(dns_codec.decode_record(raw_record(5, hex("01610000")), 0)))
+    // An SOA with nineteen bytes of numbers.
+    test.assert(is_mismatch(dns_codec.decode_record(raw_record(6, hex("0000 00000000 00000000 00000000 00000000 000000")), 0)))
+    // A TXT string that claims more bytes than the RDATA has.
+    test.assert(is_mismatch(dns_codec.decode_record(raw_record(16, hex("05616263")), 0)))
+    // An OPT option cut inside its header, and one cut inside its data.
+    test.assert(is_mismatch(dns_codec.decode_record(raw_record(41, hex("000a00")), 0)))
+    test.assert(is_mismatch(dns_codec.decode_record(raw_record(41, hex("000a000401")), 0)))
+
+@test
+fn test_a_record_cut_before_its_fixed_fields_is_truncated()
+    match dns_codec.decode_record(hex("00 0001 0001"), 0)
+        Ok(_)  => test.fail("the TTL and RDLENGTH are missing")
+        Err(e) =>
+            match e
+                DnsTruncatedMessage(have, need) =>
+                    test.assert_eq(have, 5)
+                    test.assert_eq(need, 11)
+                _                               => test.fail("a short record is DnsTruncatedMessage")
+
+@test
+fn test_an_empty_txt_record_is_no_strings_and_an_empty_string_is_one()
+    match dns_codec.decode_record(raw_record(16, []), 0)
+        Ok(got) =>
+            match got.record.data
+                RdataTxt(strings) => test.assert_eq(list.len(strings), 0)
+                _                 => test.fail("type 16 is TXT")
+        Err(_)  => test.fail("an empty TXT RDATA reads")
+    let rec = record("a", 0, RdataTxt([[]]))
+    let wire = dns_codec.encode_record(dns_codec.compressor(), rec, 0)
+    test.assert_eq(list.len(wire.bytes), 3 + 10 + 1)
+
+@test
+fn test_a_txt_string_longer_than_255_is_written_as_several()
+    let long: [u8] = list.map(0..300, i => 0x78 as u8)
+    let rec = record("a", 0, RdataTxt([long]))
+    let wire = dns_codec.encode_record(dns_codec.compressor(), rec, 0)
+    match dns_codec.decode_record(wire.bytes, 0)
+        Err(_)  => test.fail("the split strings read back")
+        Ok(got) =>
+            match got.record.data
+                RdataTxt(strings) =>
+                    test.assert_eq(list.len(strings), 2)
+                    test.assert_eq(list.len(strings[0]), 255)
+                    test.assert_eq(list.len(strings[1]), 45)
+                _                 => test.fail("type 16 is TXT")
+
+// ── Messages ────────────────────────────────────────────────────────
+
+@test
+fn test_a_header_that_promises_more_than_the_bytes_hold_is_a_count_mismatch()
+    // The query with its question count raised to two, and a response
+    // header promising one answer and holding none.
+    var two = dig_query()
+    two[5] = 2 as u8
+    two[11] = 0 as u8
+    let cut = list.slice(two, 0, 29)
+    match dns_codec.decode_message(cut)
+        Ok(_)  => test.fail("the second question is missing")
+        Err(e) =>
+            match e
+                DnsCountMismatch(declared, found) =>
+                    test.assert_eq(declared, 2)
+                    test.assert_eq(found, 1)
+                _                                 => test.fail("the refusal is DnsCountMismatch")
+    var one = dig_query()
+    one[7] = 1 as u8
+    one[11] = 0 as u8
+    match dns_codec.decode_message(list.slice(one, 0, 29))
+        Ok(_)  => test.fail("the answer is missing")
+        Err(e) =>
+            match e
+                DnsCountMismatch(declared, found) =>
+                    test.assert_eq(declared, 1)
+                    test.assert_eq(found, 0)
+                _                                 => test.fail("the refusal is DnsCountMismatch")
+
+@test
+fn test_a_question_cut_before_its_type_is_truncated()
+    match dns_codec.decode_question(hex("03 636f6d 00 00"), 0)
+        Ok(_)  => test.fail("the type and class are missing")
+        Err(e) =>
+            match e
+                DnsTruncatedMessage(_, need) => test.assert_eq(need, 9)
+                _                            => test.fail("a short question is DnsTruncatedMessage")
+
+@test
+fn test_a_message_that_fits_its_limit_is_written_whole()
+    let msg = every_type()
+    let whole = dns_codec.encode_message(msg)
+    match dns_codec.encode_message_limited(msg, list.len(whole))
+        Err(_)   => test.fail("it fits exactly")
+        Ok(wire) => test.assert(same(wire, whole))
+
+@test
+fn test_a_truncated_response_counts_what_it_kept()
+    let answers = [record("example.com", 60, RdataA([1 as u8, 1 as u8, 1 as u8, 1 as u8])),
+                   record("example.com", 60, RdataA([2 as u8, 2 as u8, 2 as u8, 2 as u8])),
+                   record("example.com", 60, RdataA([3 as u8, 3 as u8, 3 as u8, 3 as u8]))]
+    let msg = DnsMessage {
+        header: header(9, 0x8180),
+        questions: [question("example.com", DnsTypeA)],
+        answers: answers,
+        authorities: [record("example.com", 60, RdataNs(name("ns.example.com")))],
+        additionals: [record("ns.example.com", 60, RdataA([4 as u8, 4 as u8, 4 as u8, 4 as u8]))] }
+    // Header 12 + question 17 = 29; each answer is 2 + 10 + 4 = 16.
+    match dns_codec.encode_message_limited(msg, 29 + 16 + 16 + 5)
+        Err(_)   => test.fail("two answers fit")
+        Ok(wire) =>
+            test.assert_eq(list.len(wire), 29 + 32)
+            match dns_codec.decode_message(wire)
+                Err(_)   => test.fail("a truncated response is a legal message")
+                Ok(back) =>
+                    test.assert(back.header.flags.truncated)
+                    test.assert_eq(list.len(back.answers), 2)
+                    test.assert_eq(back.header.authority_count, 0)
+                    test.assert_eq(back.header.additional_count, 0)
+    // With room for everything but the additional record, the authority
+    // record is kept and counted.
+    match dns_codec.encode_message_limited(msg, 29 + 48 + 20)
+        Err(_)   => test.fail("the answers and the authority fit")
+        Ok(wire) =>
+            match dns_codec.decode_message(wire)
+                Err(_)   => test.fail("a truncated response is a legal message")
+                Ok(back) =>
+                    test.assert_eq(list.len(back.answers), 3)
+                    test.assert_eq(list.len(back.authorities), 1)
+                    test.assert_eq(list.len(back.additionals), 0)
+                    test.assert(back.header.flags.truncated)
+
+// ── Flags, codes, EDNS0 ─────────────────────────────────────────────
+
+@test
+fn test_every_flag_bit_round_trips()
+    for bit in 0..16
+        let word = 1 << bit
+        test.assert_eq(dns_codec.encode_flags(dns_codec.decode_flags(word)), word)
+    test.assert_eq(dns_codec.encode_flags(dns_codec.decode_flags(0xFFFF)), 0xFFFF)
+
+@test
+fn test_every_opcode_and_rcode_keeps_its_number()
+    for code in 0..16
+        let word = (code << 11) | code
+        test.assert_eq(dns_codec.encode_flags(dns_codec.decode_flags(word)), word)
+    match dns_codec.decode_flags(1 << 11).opcode
+        DnsInverseQuery => test.assert(true)
+        _               => test.fail("opcode 1 is IQUERY")
+    match dns_codec.decode_flags(2 << 11).opcode
+        DnsServerStatus => test.assert(true)
+        _               => test.fail("opcode 2 is STATUS")
+    match dns_codec.decode_flags(4 << 11).opcode
+        DnsNotify => test.assert(true)
+        _         => test.fail("opcode 4 is NOTIFY")
+    match dns_codec.decode_flags(5 << 11).opcode
+        DnsUpdate => test.assert(true)
+        _         => test.fail("opcode 5 is UPDATE")
+    match dns_codec.decode_flags(1).rcode
+        DnsFormatError => test.assert(true)
+        _              => test.fail("rcode 1 is FORMERR")
+    match dns_codec.decode_flags(2).rcode
+        DnsServerFailure => test.assert(true)
+        _                => test.fail("rcode 2 is SERVFAIL")
+    match dns_codec.decode_flags(4).rcode
+        DnsNotImplemented => test.assert(true)
+        _                 => test.fail("rcode 4 is NOTIMP")
+    match dns_codec.decode_flags(5).rcode
+        DnsRefused => test.assert(true)
+        _          => test.fail("rcode 5 is REFUSED")
+
+@test
+fn test_every_type_and_class_code_reads_back_to_itself()
+    let codes = [1, 2, 5, 6, 12, 15, 16, 28, 33, 41, 255, 64]
+    for code in codes
+        test.assert_eq(dns_codec.type_code(dns_codec.type_of_code(code)), code)
+    for code in [1, 3, 254, 255]
+        test.assert_eq(dns_codec.class_code(dns_codec.class_of_code(code)), code)
+
+@test
+fn test_an_opt_record_off_the_root_or_doubled_is_refused()
+    let opt = DnsOpt { payload_size: 1232, extended_rcode: 0, version: 0, dnssec_ok: false, options: [] }
+    let off_root = DnsRecord { name: name("example.com"), record_class: DnsClassOther(1232),
+                               ttl: 0, data: RdataOpt([]) }
+    match dns_codec.read_opt(off_root)
+        Ok(_)  => test.fail("an OPT record lives on the root")
+        Err(e) =>
+            match e
+                DnsBadOptRecord => test.assert(true)
+                _               => test.fail("the refusal is DnsBadOptRecord")
+    let not_opt = DnsRecord { name: dns_codec.root_name(), record_class: DnsClassInternet,
+                              ttl: 0, data: RdataA([1 as u8, 2 as u8, 3 as u8, 4 as u8]) }
+    match dns_codec.read_opt(not_opt)
+        Ok(_)  => test.fail("an A record on the root is still not an OPT record")
+        Err(e) =>
+            match e
+                DnsBadOptRecord => test.assert(true)
+                _               => test.fail("the refusal is DnsBadOptRecord")
+    let doubled = DnsMessage {
+        header: header(1, 0),
+        questions: [],
+        answers: [],
+        authorities: [],
+        additionals: [dns_codec.opt_record(opt), dns_codec.opt_record(opt)] }
+    match dns_codec.find_opt(doubled)
+        Ok(_)  => test.fail("two OPT records are one too many")
+        Err(e) =>
+            match e
+                DnsBadOptRecord => test.assert(true)
+                _               => test.fail("the refusal is DnsBadOptRecord")
+    let none = DnsMessage { header: header(1, 0), questions: [], answers: [], authorities: [],
+                            additionals: [record("a", 0, RdataA([1 as u8, 2 as u8, 3 as u8, 4 as u8]))] }
+    match dns_codec.find_opt(none)
+        Ok(found) => test.assert(found == None)
+        Err(_)    => test.fail("no OPT record is not an error")
+
+@test
+fn test_an_opt_record_carries_the_version_and_the_extended_rcode()
+    let opt = DnsOpt { payload_size: 512, extended_rcode: 1, version: 1, dnssec_ok: true, options: [] }
+    let rec = dns_codec.opt_record(opt)
+    test.assert_eq(rec.ttl, 0x01018000)
+    match dns_codec.read_opt(rec)
+        Err(_)   => test.fail("it reads back")
+        Ok(back) =>
+            test.assert_eq(back.extended_rcode, 1)
+            test.assert_eq(back.version, 1)
+            test.assert_eq(back.payload_size, 512)
+    // A payload size that is also a class number reads back as that
+    // class, and still as its number.
+    let small = dns_codec.opt_record(DnsOpt { payload_size: 1, extended_rcode: 0, version: 0,
+                                             dnssec_ok: false, options: [] })
+    match dns_codec.read_opt(small)
+        Ok(back) => test.assert_eq(back.payload_size, 1)
+        Err(_)   => test.fail("it reads back")
+    // BADVERS over a header that says NXDOMAIN's low bits.
+    var h = header(1, 0x8183)
+    test.assert_eq(dns_codec.extended_rcode(h, Some(opt)), 0x13)
+
+// ── TCP ─────────────────────────────────────────────────────────────
+
+@test
+fn test_a_length_prefix_with_a_short_body_is_partial()
+    match dns_codec.scan_tcp(hex("000c 0102"))
+        DnsTcpPartial  => test.assert(true)
+        DnsTcpWhole(_) => test.fail("twelve bytes were promised and two arrived")
+    let step = dns_codec.take_tcp(dns_codec.feed_tcp(dns_codec.tcp_reader(), hex("000c 0102")).reader)
+    test.assert(step.message == None)
+    test.assert_eq(dns_codec.tcp_pending_len(step.reader), 4)
+
+// ── Errors ──────────────────────────────────────────────────────────
+
+@test
+fn test_every_error_reads_as_a_sentence()
+    test.assert_eq(DnsTruncatedMessage(5, 12).message(), "the message is 5 bytes and the field needs 12")
+    test.assert_eq(DnsLabelTooLong(64).message(), "a label of 64 bytes is longer than 63")
+    test.assert_eq(DnsNameTooLong(321).message(), "a name of 321 bytes is longer than 255")
+    test.assert_eq(DnsEmptyLabel(1).message(), "label 1 is empty")
+    test.assert_eq(DnsReservedLabelBits(0).message(), "the length byte at 0 uses the reserved bits")
+    test.assert_eq(DnsForwardPointer(0, 8).message(), "the pointer at 0 points forwards to 8")
+    test.assert_eq(DnsPointerLoop(2).message(), "the pointer at 2 points back into the name it ends")
+    test.assert_eq(DnsCountMismatch(2, 1).message(), "the header declares 2 entries and the message holds 1")
+    test.assert_eq(DnsRdataLengthMismatch(16, 4).message(), "the RDLENGTH is 16 and the data is 4 bytes")
+    test.assert_eq(DnsBadOptRecord.message(), "the OPT record is not on the root name, or there is more than one")
+    test.assert_eq(DnsWouldTruncate(33, 20).message(),
+        "the header and questions need 33 bytes and the limit is 20")
+    test.assert_eq(DnsBadNameText(3).message(), "the name text is malformed at offset 3")
