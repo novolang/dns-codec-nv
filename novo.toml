@@ -1,6 +1,6 @@
 [package]
 name        = "dns-codec-nv"
-version     = "0.1.0"
+version     = "0.1.1"
 description = "RFC 1035 wire format as a codec with no socket: header, question, the resource records a resolver meets, name compression both directions, EDNS0, and a feed-and-drain reader for TCP's length-prefixed framing."
 license     = "Apache-2.0"
 
@@ -23,7 +23,7 @@ category    = "networking"
 tags        = ["dns", "rfc1035", "edns0", "codec", "sans-io", "resolver", "name-compression", "embedded"]
 repository  = "https://github.com/novolang/dns-codec-nv"
 maintainers = ["novo-lang"]
-novo        = ">= 0.13.0"
+novo        = ">= 0.21.1"
 
 [docs.pages]
 "README.md" = "DNS messages, without a socket"

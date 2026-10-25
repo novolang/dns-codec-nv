@@ -65,15 +65,15 @@ fn put8(var out: [u8], v: Int) -> [u8]
 // A sixteen-bit field, big-endian.
 @tier(rt)
 fn put16(var out: [u8], v: Int) -> [u8]
-    out = put8(out, v >> 8)
-    out = put8(out, v)
+    out = put8(var out, v >> 8)
+    out = put8(var out, v)
     out
 
 // A thirty-two-bit field, big-endian.
 @tier(rt)
 fn put32(var out: [u8], v: Int) -> [u8]
-    out = put16(out, v >> 16)
-    out = put16(out, v)
+    out = put16(var out, v >> 16)
+    out = put16(var out, v)
     out
 
 // The sixteen-bit big-endian field at `i`.  The caller has checked that
@@ -126,10 +126,10 @@ fn name_of_labels(labels: [[u8]]) -> Result<DnsName, DnsCodecError>
             return Err(DnsEmptyLabel(index))
         if n > LABEL_MAX
             return Err(DnsLabelTooLong(n))
-        wire = put8(wire, n)
+        wire = put8(var wire, n)
         wire = list.append(wire, label)
         index = index + 1
-    wire = put8(wire, 0)
+    wire = put8(var wire, 0)
     if list.len(wire) > NAME_MAX
         return Err(DnsNameTooLong(list.len(wire)))
     Ok(DnsName { wire: wire })
@@ -235,7 +235,7 @@ fn name_from_text(text: Str) -> Result<DnsName, DnsCodecError>
                 return Err(DnsLabelTooLong(len))
             wire[label_at] = len as u8
             label_at = list.len(wire)
-            wire = put8(wire, 0)
+            wire = put8(var wire, 0)
         else if c == '\\'
             let d = str.byte_at_or(text, i + 1, -1)
             if d < 0
@@ -248,20 +248,20 @@ fn name_from_text(text: Str) -> Result<DnsName, DnsCodecError>
                 let v = (d - '0') * 100 + (d2 - '0') * 10 + (d3 - '0')
                 if v > 255
                     return Err(DnsBadNameText(i))
-                wire = put8(wire, v)
+                wire = put8(var wire, v)
                 skip = 3
             else
-                wire = put8(wire, d)
+                wire = put8(var wire, d)
                 skip = 1
         else
-            wire = put8(wire, c)
+            wire = put8(var wire, c)
     // Without a trailing dot the last label is still open.
     let last = list.len(wire) - label_at - 1
     if last > 0
         if last > LABEL_MAX
             return Err(DnsLabelTooLong(last))
         wire[label_at] = last as u8
-        wire = put8(wire, 0)
+        wire = put8(var wire, 0)
     if list.len(wire) > NAME_MAX
         return Err(DnsNameTooLong(list.len(wire)))
     Ok(DnsName { wire: wire })
@@ -364,12 +364,12 @@ pub struct DnsHeader
 pub @tier(rt)
 fn encode_header(header: DnsHeader) -> [u8]
     var out: [u8] = []
-    out = put16(out, header.id)
-    out = put16(out, encode_flags(header.flags))
-    out = put16(out, header.question_count)
-    out = put16(out, header.answer_count)
-    out = put16(out, header.authority_count)
-    out = put16(out, header.additional_count)
+    out = put16(var out, header.id)
+    out = put16(var out, encode_flags(header.flags))
+    out = put16(var out, header.question_count)
+    out = put16(var out, header.answer_count)
+    out = put16(var out, header.authority_count)
+    out = put16(var out, header.additional_count)
     out
 
 // Read the header from the front of a message.
@@ -729,7 +729,7 @@ fn encode_name(c: DnsCompressor, name: DnsName, offset: Int) -> DnsNameWrite
     for pos in label_starts(name)
         let target = remembered(c, name.wire, pos)
         if target >= 0
-            out = put16(out, (POINTER_TAG << 8) | target)
+            out = put16(var out, (POINTER_TAG << 8) | target)
             return DnsNameWrite { compressor: DnsCompressor { entries: entries }, bytes: out }
         let here = offset + list.len(out)
         if here <= POINTER_REACH
@@ -737,7 +737,7 @@ fn encode_name(c: DnsCompressor, name: DnsName, offset: Int) -> DnsNameWrite
             entries = list.push(entries, DnsNameOffset { name: DnsName { wire: suffix }, offset: here })
         let n = name.wire[pos] as Int
         out = list.append(out, list.slice(name.wire, pos, pos + 1 + n))
-    out = put8(out, 0)
+    out = put8(var out, 0)
     DnsNameWrite { compressor: DnsCompressor { entries: entries }, bytes: out }
 
 // Write a name in full, with no pointer and no memory.
@@ -801,7 +801,7 @@ fn decode_name(message: [u8], offset: Int) -> Result<DnsNameRead, DnsCodecError>
         else if tag != 0
             return Err(DnsReservedLabelBits(pos))
         else if b == 0
-            wire = put8(wire, 0)
+            wire = put8(var wire, 0)
             if next < 0
                 next = pos + 1
             return Ok(DnsNameRead { name: DnsName { wire: wire }, next: next })
@@ -820,8 +820,8 @@ pub @tier(rt)
 fn encode_question(c: DnsCompressor, question: DnsQuestion, offset: Int) -> DnsNameWrite
     let named = encode_name(c, question.name, offset)
     var out = named.bytes[:]
-    out = put16(out, type_code(question.question_type))
-    out = put16(out, class_code(question.question_class))
+    out = put16(var out, type_code(question.question_type))
+    out = put16(var out, class_code(question.question_class))
     DnsNameWrite { compressor: named.compressor, bytes: out }
 
 // A question and where the reader should carry on.
@@ -863,13 +863,13 @@ fn rdata_type(data: DnsRdata) -> Int
 fn put_txt(var out: [u8], s: [u8]) -> [u8]
     let n = list.len(s)
     if n == 0
-        out = put8(out, 0)
+        out = put8(var out, 0)
         return out
     let pieces = (n + 254) / 255
     for p in 0..pieces
         let lo = p * 255
         let hi = min_int(lo + 255, n)
-        out = put8(out, hi - lo)
+        out = put8(var out, hi - lo)
         out = list.append(out, list.slice(s, lo, hi))
     out
 
@@ -877,7 +877,7 @@ fn put_txt(var out: [u8], s: [u8]) -> [u8]
 @tier(rt)
 fn encode_mx(c: DnsCompressor, mx: DnsMx, offset: Int) -> DnsNameWrite
     var out: [u8] = []
-    out = put16(out, mx.preference)
+    out = put16(var out, mx.preference)
     let named = encode_name(c, mx.exchange, offset + 2)
     out = list.append(out, named.bytes)
     DnsNameWrite { compressor: named.compressor, bytes: out }
@@ -886,9 +886,9 @@ fn encode_mx(c: DnsCompressor, mx: DnsMx, offset: Int) -> DnsNameWrite
 @tier(rt)
 fn encode_srv(srv: DnsSrv) -> [u8]
     var out: [u8] = []
-    out = put16(out, srv.priority)
-    out = put16(out, srv.weight)
-    out = put16(out, srv.port)
+    out = put16(var out, srv.priority)
+    out = put16(var out, srv.weight)
+    out = put16(var out, srv.port)
     out = list.append(out, srv.target.wire)
     out
 
@@ -900,11 +900,11 @@ fn encode_soa(c: DnsCompressor, soa: DnsSoa, offset: Int) -> DnsNameWrite
     var out: [u8] = []
     out = list.append(out, primary.bytes)
     out = list.append(out, mailbox.bytes)
-    out = put32(out, soa.serial)
-    out = put32(out, soa.refresh)
-    out = put32(out, soa.retry)
-    out = put32(out, soa.expire)
-    out = put32(out, soa.minimum)
+    out = put32(var out, soa.serial)
+    out = put32(var out, soa.refresh)
+    out = put32(var out, soa.retry)
+    out = put32(var out, soa.expire)
+    out = put32(var out, soa.minimum)
     DnsNameWrite { compressor: mailbox.compressor, bytes: out }
 
 // The TXT data: each string with its length byte.
@@ -912,7 +912,7 @@ fn encode_soa(c: DnsCompressor, soa: DnsSoa, offset: Int) -> DnsNameWrite
 fn encode_txt(strings: [[u8]]) -> [u8]
     var out: [u8] = []
     for s in strings
-        out = put_txt(out, s)
+        out = put_txt(var out, s)
     out
 
 // The OPT data: each option as its code, its length and its bytes.
@@ -920,8 +920,8 @@ fn encode_txt(strings: [[u8]]) -> [u8]
 fn encode_options(options: [DnsOption]) -> [u8]
     var out: [u8] = []
     for o in options
-        out = put16(out, o.code)
-        out = put16(out, list.len(o.data))
+        out = put16(var out, o.code)
+        out = put16(var out, list.len(o.data))
         out = list.append(out, o.data)
     out
 
@@ -960,10 +960,10 @@ fn encode_record(c: DnsCompressor, record: DnsRecord, offset: Int) -> DnsNameWri
     let rdata_at = offset + list.len(named.bytes) + 10
     let rdata = encode_rdata(named.compressor, record.data, rdata_at)
     var out = named.bytes[:]
-    out = put16(out, rdata_type(record.data))
-    out = put16(out, class_code(record.record_class))
-    out = put32(out, record.ttl)
-    out = put16(out, list.len(rdata.bytes))
+    out = put16(var out, rdata_type(record.data))
+    out = put16(var out, class_code(record.record_class))
+    out = put32(var out, record.ttl)
+    out = put16(var out, list.len(rdata.bytes))
     out = list.append(out, rdata.bytes)
     DnsNameWrite { compressor: rdata.compressor, bytes: out }
 
@@ -1425,7 +1425,7 @@ pub enum DnsTcpScan
 pub @tier(rt)
 fn frame_tcp(message: [u8]) -> [u8]
     var out: [u8] = []
-    out = put16(out, list.len(message))
+    out = put16(var out, list.len(message))
     out = list.append(out, message)
     out
 
